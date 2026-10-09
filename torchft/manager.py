@@ -57,7 +57,7 @@ from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.checkpointing._rwlock import RWLock
 from torchft.futures import future_timeout
-from torchft.utils import get_stream_context, synchronize
+from torchft.utils import get_stream_context, npu_is_available, synchronize
 from torchft.work import _DummyWork
 
 if TYPE_CHECKING:
@@ -1351,6 +1351,10 @@ class _ManagedWork(dist._Work):
         self._assert_same_stream()
 
         if torch.cuda.is_available():
+            self.block_current_stream()
+        elif npu_is_available():
+            # HCCL is stream-ordered like NCCL: block on the PG stream so the
+            # future callback fires only after the in-flight collective lands.
             self.block_current_stream()
         elif torch.xpu.is_available():
             self._set_future_callback()

@@ -13,6 +13,7 @@ from torchft.process_group import (
     ProcessGroupBabyNCCL,
     ProcessGroupBabyXCCL,
     ProcessGroupGloo,
+    ProcessGroupHCCL,
     ProcessGroupNCCL,
     ProcessGroupXCCL,
 )
@@ -28,6 +29,7 @@ __all__ = (
     "Optimizer",
     "ProcessGroupNCCL",
     "ProcessGroupXCCL",
+    "ProcessGroupHCCL",
     "ProcessGroupBabyNCCL",
     "ProcessGroupBabyXCCL",
     "ProcessGroupGloo",

@@ -14,6 +14,20 @@ from typing import Any, Optional, Union
 import torch
 
 
+def npu_is_available() -> bool:
+    """
+    Whether Ascend NPU is available.
+
+    ``torch.npu`` only exists after importing ``torch_npu`` so this is safe
+    to call on machines without the Ascend software stack installed.
+    """
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return torch.npu.is_available()
+
+
 def get_stream_context(
     stream: Optional[torch.Stream],
 ) -> Union[torch.cuda.StreamContext, torch.xpu.StreamContext, nullcontext[None]]:
@@ -37,6 +51,8 @@ def get_stream_context(
         elif torch.xpu.is_available():
             # pyre-fixme[6]: Expected `Optional[streams.Stream]` but got `_C.Stream`
             return torch.xpu.stream(stream)
+        elif npu_is_available():
+            return torch.npu.stream(stream)
         else:
             return nullcontext()
     else:
@@ -56,6 +72,11 @@ def record_event() -> Union[torch.cuda.Event, torch.xpu.Event]:
         torch.xpu.current_stream().record_event(xpu_event)
         return xpu_event
 
+    if npu_is_available():
+        npu_event = torch.npu.Event(interprocess=True)
+        torch.npu.current_stream().record_event(npu_event)
+        return npu_event
+
     cuda_event = torch.cuda.Event(interprocess=True)
     torch.cuda.current_stream().record_event(cuda_event)
     return cuda_event
@@ -70,3 +91,5 @@ def synchronize() -> None:
         torch.cuda.current_stream().synchronize()
     elif torch.xpu.is_available():
         torch.xpu.current_stream().synchronize()
+    elif npu_is_available():
+        torch.npu.current_stream().synchronize()

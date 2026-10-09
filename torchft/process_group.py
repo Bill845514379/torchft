@@ -68,7 +68,7 @@ from torch.utils._pytree import tree_any
 # We import these for backwards compatibility
 from torchft.futures import context_timeout, stream_timeout
 from torchft.multiprocessing import _MonitoredPipe
-from torchft.utils import get_stream_context, record_event, synchronize
+from torchft.utils import get_stream_context, npu_is_available, record_event, synchronize
 from torchft.work import _DummyWork
 
 if TYPE_CHECKING:
@@ -335,6 +335,8 @@ class ProcessGroup(BaseProcessGroup):
             devices.append("cuda")
         elif torch.xpu.is_available():
             devices.append("xpu")
+        if npu_is_available():
+            devices.append("npu")
         dist.Backend.register_backend(group_name, create_pg, devices=devices)
 
         return group_name
@@ -502,6 +504,8 @@ class ProcessGroupWrapper(ProcessGroup):
                         backend = pg._get_backend(torch.device("cuda"))
                     elif torch.xpu.is_available():
                         backend = pg._get_backend(torch.device("xpu"))
+                    elif npu_is_available():
+                        backend = pg._get_backend(torch.device("npu"))
                 except RuntimeError:
                     backend = None
                 if backend is not None and hasattr(backend, "abort"):
@@ -677,6 +681,10 @@ class ProcessGroupGloo(ProcessGroupWrapper):
         if torch.xpu.is_available():
             pg._register_backend(
                 torch.device("xpu"), ProcessGroup.BackendType.GLOO, backend_class
+            )
+        if npu_is_available():
+            pg._register_backend(
+                torch.device("npu"), ProcessGroup.BackendType.GLOO, backend_class
             )
         return pg
 
@@ -1016,6 +1024,160 @@ class ProcessGroupXCCL(ProcessGroupWrapper):
 
     def getBackendName(self) -> str:
         return "torchft-xccl"
+
+
+class ProcessGroupHCCL(ProcessGroupWrapper):
+    """
+    This is a reconfigurable version of ProcessGroupHCCL for Ascend NPU devices.
+
+    Recovery design follows the W0 HCCL fault-tolerance probe verdict
+    ("verdict B"): ``abort_hccl_comm`` cannot unblock in-flight collectives,
+    so the primary recovery mechanism is a bounded user-space wait (the
+    context timeout in ``_run_context``) -> mark the PG errored -> abandon the
+    collective -> reconfigure the PG on a new store prefix. ``abort()`` is
+    only used for best-effort corpse collection of the abandoned HCCL comm
+    (W0 P5: reclaims ~413MB per comm, equivalent to dropping the reference).
+
+    HARD CONSTRAINT (W0 P5): the abandoned ProcessGroup must not be retained
+    by any global reference or the process can no longer create new PGs.
+    ``configure()`` replaces ``self._pg`` which drops the last reference to
+    the old PG and triggers reclamation.
+
+    The HCCL watchdog is stopped on the backend (W0 probe1: with the watchdog
+    running it kills the process on its own timeout, racing torchft's
+    user-space bounded wait). torchft fully owns the timeout.
+
+    Args:
+        timeout: the timeout to use for HCCL operations.
+    """
+
+    def __init__(self, timeout: timedelta = timedelta(seconds=60.0)) -> None:
+        super().__init__(timeout)
+        # W0 verdict B: abort cannot unblock in-flight work on HCCL. Keep the
+        # NCCL-style abort-driven recovery off by default; the knob is kept
+        # for future torch_npu versions that may grow a working abort.
+        self._use_abort: bool = (
+            os.environ.get("TORCHFT_HCCL_USE_ABORT", "false") == "true"
+        )
+
+        self._errored: Optional[Exception] = None
+
+    def _opts_hook(self, opts: T) -> T:
+        if not self._use_abort:
+            return opts
+
+        # We need to clear the timeout to apply our own timeout that doesn't
+        # crash the whole program.
+        if hasattr(opts, "timeout"):
+            # apply default timeout to disable
+            # pyrefly: ignore [missing-attribute]
+            opts.timeout = AllgatherOptions().timeout
+        return opts
+
+    def _wrap_work(self, work: Work, opts: object) -> Work:
+        if not self._use_abort:
+            return work
+
+        timeout = self._timeout
+        # pyre-fixme[16]: no attribute timeout
+        if hasattr(opts, "timeout") and opts.timeout.total_seconds() > 0:
+            timeout = opts.timeout
+        return _WorkAcceleratorTimeout(self, work, timeout)
+
+    @contextmanager
+    def _run_context(self) -> Generator[None, None, None]:
+        timeout: timedelta = self._timeout
+
+        def callback() -> None:
+            logger.error(f"aborting after {timeout}!")
+            self.abort()
+
+        # bounded wait: make sure collectives can timeout so torchft can
+        # abandon the collective and reconfigure instead of hanging forever
+        # (HCCL cannot unblock in-flight work itself, W0 verdict B).
+        with context_timeout(callback, timeout):
+            yield
+
+    def _create_pg(self, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
+        # pyre-fixme[21]: no attribute ProcessGroupHCCL
+        from torch_npu._C._distributed_c10d import (
+            ProcessGroupHCCL as BaseProcessGroupHCCL,
+        )
+
+        self._errored = None
+
+        # pyre-fixme[16]: no attribute ProcessGroupHCCL
+        opts = BaseProcessGroupHCCL.Options()
+        # HCCL Options has no config.blocking (W0 probe0 inventory); the
+        # timeout lives directly on the Options object.
+        # pyrefly: ignore [missing-attribute]
+        opts._timeout = self._timeout
+        if self._global_ranks:
+            opts.global_ranks_in_group = self._global_ranks
+        if self._group_rank and self._group_world_size:
+            # pyrefly: ignore [bad-assignment]
+            opts.group_name = f"torchft_quorum_{self._quorum_id}_rank_{self._group_rank % self._group_world_size}"
+
+        pg = BaseProcessGroup(store, rank, world_size)
+        # HCCL PGs register as a CUSTOM backend type in torch_npu
+        pg._set_default_backend(ProcessGroup.BackendType.CUSTOM)
+        # pyre-fixme[16]: no attribute ProcessGroupHCCL
+        backend_class = BaseProcessGroupHCCL(store, rank, world_size, opts)
+        backend_class._set_sequence_number_for_group()
+
+        # Stop the HCCL watchdog: it would kill the process on its own
+        # timeout (W0 probe1), racing torchft's user-space bounded wait.
+        # torchft owns the timeout entirely.
+        try:
+            from torch_npu.npu._recovery import WATCHDOG_STATUS_STOP
+
+            backend_class.set_watchdog_status(WATCHDOG_STATUS_STOP)
+        except Exception as e:
+            logger.warning(f"failed to stop HCCL watchdog, relying on it for timeout: {e}")
+
+        pg._register_backend(
+            torch.device("npu"), ProcessGroup.BackendType.CUSTOM, backend_class
+        )
+        return pg
+
+    def abort(self, errored: bool = True) -> None:
+        # We need to set the error before aborting to ensure that errored()
+        # returns the error correctly when the bounded wait fires.
+        self._errored = RuntimeError("aborted")
+
+        if self._use_abort:
+            # best-effort corpse collection; cannot unblock in-flight work
+            # (W0 probe2), P5 showed this is equivalent to dropping the
+            # reference for resource reclamation.
+            pg = self._pg
+            if pg is not None:
+                try:
+                    backend = pg._get_backend(torch.device("npu"))
+                    backend._delete_tcpstore_key()
+                    backend.abort_hccl_comm("reinit")
+                except Exception as e:
+                    logger.warning(f"HCCL abort (corpse collection) failed: {e}")
+
+        super().abort(errored=errored)
+
+    def errored(self) -> Optional[Exception]:
+        # force a synchronization to ensure all work is complete
+        synchronize()
+        return self._errored
+
+    def barrier(self, opts: Optional[BarrierOptions] = None) -> Work:
+        # c10d's default barrier resolves the device from BarrierOptions and
+        # falls back to CPU, which has no backend registered on HCCL PGs
+        # ("No backend type associated with device type cpu"). Route it to
+        # the NPU backend like ProcessGroupNCCL does for CUDA.
+        if opts is None:
+            opts = BarrierOptions()
+        if getattr(opts, "device", None) is None:
+            opts.device = torch.device("npu")
+        return super().barrier(opts)
+
+    def getBackendName(self) -> str:
+        return "torchft-hccl"
 
 
 class ProcessGroupDummy(ProcessGroup):
@@ -1416,6 +1578,17 @@ def _is_any_xpu(obj: object) -> bool:
     return tree_any(lambda obj: isinstance(obj, torch.Tensor) and obj.is_xpu, obj)
 
 
+def _is_any_npu(obj: object) -> bool:
+    """
+    Returns true if any of the tensors in the object are NPU tensors.
+
+    Supports lists, tuples, dicts, and tensors.
+    """
+    return tree_any(
+        lambda obj: isinstance(obj, torch.Tensor) and obj.device.type == "npu", obj
+    )
+
+
 @dataclass
 class _OpMetadata:
     work: Work
@@ -1624,7 +1797,7 @@ class ProcessGroupBaby(ProcessGroup):
                                 dict[str, object],
                                 int,
                                 int,
-                                Optional[Union[torch.cuda.Event, torch.xpu.Event]],
+                                Optional[Union[torch.cuda.Event, torch.xpu.Event, "torch.npu.Event"]],
                             ],
                             op[1:],
                         )
@@ -1727,7 +1900,7 @@ class ProcessGroupBaby(ProcessGroup):
                         int,
                         str,
                         object,
-                        Optional[Union[torch.cuda.Event, torch.xpu.Event]],
+                        Optional[Union[torch.cuda.Event, torch.xpu.Event, "torch.npu.Event"]],
                     ],
                     cmd,
                 )
@@ -1762,7 +1935,7 @@ class ProcessGroupBaby(ProcessGroup):
 
         assert self._pipe is not None
         op_id, event = cast(
-            Tuple[int, Optional[Union[torch.cuda.Event, torch.xpu.Event]]],
+            Tuple[int, Optional[Union[torch.cuda.Event, torch.xpu.Event, "torch.npu.Event"]]],
             self._pipe.recv(timeout or self._timeout),
         )
         assert op_id == op_id
@@ -1783,7 +1956,7 @@ class ProcessGroupBaby(ProcessGroup):
         pipe = self._pipe
         assert pipe is not None
 
-        is_accelerator = _is_any_cuda(args) or _is_any_xpu(args)
+        is_accelerator = _is_any_cuda(args) or _is_any_xpu(args) or _is_any_npu(args)
 
         stream_device = (
             torch.accelerator.current_stream().device if is_accelerator else None
