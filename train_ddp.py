@@ -15,6 +15,9 @@ os.environ["NCCL_HOSTID"] = str(REPLICA_GROUP_ID)
 # Set XPU device visibility for Intel XPU devices
 if "XPU_VISIBLE_DEVICES" not in os.environ:
     os.environ["XPU_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
+# Set NPU device visibility for Ascend NPU devices
+if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(REPLICA_GROUP_ID % 4)
 
 import torch
 import torch.nn.functional as F
@@ -23,12 +26,19 @@ import torchvision.transforms as transforms
 from torch import nn, optim
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchdata.stateful_dataloader import StatefulDataLoader
+
+try:
+    import torch_npu  # noqa: F401  # registers the npu device with torch
+except ImportError:
+    pass
+
 from torchft import (
     DistributedDataParallel,
     DistributedSampler,
     Manager,
     Optimizer,
     ProcessGroupGloo,
+    ProcessGroupHCCL,
     ProcessGroupNCCL,
     ProcessGroupXCCL,
 )
@@ -81,6 +91,9 @@ def main() -> None:
     if torch.cuda.is_available():
         device = "cuda"
         pg = ProcessGroupNCCL(timeout=timedelta(seconds=30))
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        device = "npu"
+        pg = ProcessGroupHCCL(timeout=timedelta(seconds=30))
     elif torch.xpu.is_available():
         device = "xpu"
         pg = ProcessGroupXCCL(timeout=timedelta(seconds=30))
@@ -94,6 +107,8 @@ def main() -> None:
         device=(
             "cuda"
             if torch.cuda.is_available()
+            else "npu"
+            if hasattr(torch, "npu") and torch.npu.is_available()
             else "xpu"
             if torch.xpu.is_available()
             else "cpu"

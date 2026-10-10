@@ -53,6 +53,9 @@ def hsdp(
     # Disable XPU for CPU-only jobs
     env.setdefault("XPU_VISIBLE_DEVICES", "")
 
+    # Disable NPU for CPU-only jobs
+    env.setdefault("ASCEND_RT_VISIBLE_DEVICES", "")
+
     roles = []
     for replica_id in range(replicas):
         cmd = [
