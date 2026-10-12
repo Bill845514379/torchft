@@ -46,6 +46,18 @@ from torchft.checkpointing.pg_transport import PGTransport
 
 logging.basicConfig(level=logging.INFO)
 
+# Optional periodic checkpointing to a shared directory (dual-node verify):
+# set TORCHFT_CKPT_DIR to enable; TORCHFT_CKPT_INTERVAL controls the cadence
+# in steps. The heal path normally restores from a live replica via
+# PGTransport; the shared-storage file is a last-resort source when the whole
+# replica group is lost.
+CKPT_DIR = os.environ.get("TORCHFT_CKPT_DIR", "")
+CKPT_INTERVAL = int(os.environ.get("TORCHFT_CKPT_INTERVAL", "200"))
+
+# Process group timeout. Cross-node HCCL cold start (RoCE comm init) can take
+# ~100s+, so the default 30s (single-node friendly) is overridable via env.
+PG_TIMEOUT_S = int(os.environ.get("TORCHFT_PG_TIMEOUT_S", "30"))
+
 
 @record
 def main() -> None:
@@ -93,7 +105,7 @@ def main() -> None:
         pg = ProcessGroupNCCL(timeout=timedelta(seconds=30))
     elif hasattr(torch, "npu") and torch.npu.is_available():
         device = "npu"
-        pg = ProcessGroupHCCL(timeout=timedelta(seconds=30))
+        pg = ProcessGroupHCCL(timeout=timedelta(seconds=PG_TIMEOUT_S))
     elif torch.xpu.is_available():
         device = "xpu"
         pg = ProcessGroupXCCL(timeout=timedelta(seconds=30))
@@ -212,7 +224,15 @@ def main() -> None:
             if manager.current_step() % 100 == 0:
                 print(f"[{manager.current_step()}] loss = {loss.item()}")
 
-            # TODO (by the user): periodically checkpoint model, optim, manager and dataloader
+            if CKPT_DIR and manager.current_step() % CKPT_INTERVAL == 0:
+                # Periodic checkpoint to shared storage (atomic replace).
+                tmp = os.path.join(CKPT_DIR, f"ckpt_rank{REPLICA_GROUP_ID}.tmp")
+                torch.save(state_dict(), tmp)
+                os.replace(
+                    tmp, os.path.join(CKPT_DIR, f"ckpt_rank{REPLICA_GROUP_ID}.pt")
+                )
+
+            # TODO (by the user): periodically checkpoint manager and dataloader
 
             # You typically want to checkpoint dataloader frequently (every step?) to
             # avoid repeated batches as it's replica group specific.
