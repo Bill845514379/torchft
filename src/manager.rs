@@ -34,18 +34,27 @@ use crate::net::connect;
 use crate::timeout::try_parse_grpc_timeout;
 use crate::torchftpb::CheckpointMetadataRequest;
 use crate::torchftpb::CheckpointMetadataResponse;
+use crate::torchftpb::CommandRequest;
+use crate::torchftpb::CommandResponse;
+use crate::torchftpb::FaultEvent;
 use crate::torchftpb::KillRequest;
 use crate::torchftpb::KillResponse;
 use crate::torchftpb::LighthouseHeartbeatRequest;
 use crate::torchftpb::LighthouseQuorumRequest;
 use crate::torchftpb::LighthouseQuorumResponse;
+use crate::torchftpb::ManagerCommandRequest;
+use crate::torchftpb::ManagerCommandResponse;
+use crate::torchftpb::manager_control_service_server::ManagerControlServiceServer;
 use crate::torchftpb::ManagerQuorumRequest;
 use crate::torchftpb::ManagerQuorumResponse;
 use crate::torchftpb::Quorum;
 use crate::torchftpb::QuorumMember;
+use crate::torchftpb::ReportEventRequest;
 use crate::torchftpb::ShouldCommitRequest;
 use crate::torchftpb::ShouldCommitResponse;
+use crate::torchftpb::lighthouse_control_service_client::LighthouseControlServiceClient;
 use crate::torchftpb::lighthouse_service_client::LighthouseServiceClient;
+use crate::torchftpb::manager_control_service_server::ManagerControlService;
 use crate::torchftpb::manager_service_client::ManagerServiceClient;
 use crate::torchftpb::manager_service_server::ManagerService;
 use crate::torchftpb::manager_service_server::ManagerServiceServer;
@@ -75,7 +84,19 @@ struct ManagerState {
     should_commit_count: HashSet<i64>,
 
     lighthouse_client: LighthouseServiceClient<Channel>,
+
+    // ==== MC-1/MC-9 control plane (contract 8 data-plane endpoint) ====
+    // commands queued for the wrapper thin executor (Python pops these via
+    // ManagerServer.pop_commands)
+    pending_commands: Vec<CommandRequest>,
+    // command_ids already seen (idempotency)
+    executed_commands: std::collections::VecDeque<String>,
+    // highest step reported by any group_rank quorum request (WINDOW_MISSED check)
+    last_known_step: i64,
 }
+
+/// Maximum buffered state for command idempotency.
+const COMMAND_ID_MEMO_CAP: usize = 1024;
 
 pub struct Manager {
     replica_id: String,
@@ -113,6 +134,43 @@ pub async fn lighthouse_client_new(
     );
     let conn = connect(addr, connect_timeout).await?;
     Ok(LighthouseServiceClient::new(conn))
+}
+
+pub async fn lighthouse_control_client_new(
+    addr: String,
+    connect_timeout: Duration,
+) -> Result<LighthouseControlServiceClient<Channel>> {
+    let conn = connect(addr, connect_timeout).await?;
+    Ok(LighthouseControlServiceClient::new(conn))
+}
+
+/// Client for the ManagerControlService (contract 8 command RPC on the data
+/// plane); used by lighthouse to forward clusterd commands.
+pub async fn manager_control_client_new(
+    addr: String,
+    connect_timeout: Duration,
+) -> Result<crate::torchftpb::manager_control_service_client::ManagerControlServiceClient<Channel>>
+{
+    let conn = connect(addr, connect_timeout).await?;
+    Ok(
+        crate::torchftpb::manager_control_service_client::ManagerControlServiceClient::new(
+            conn,
+        ),
+    )
+}
+
+/// Client for the ClusterdEventSink (contract 3 fast path push); lighthouse
+/// pushes buffered fault events to mc1d's sink fire-and-forget.
+pub async fn clusterd_event_sink_client_new(
+    addr: String,
+    connect_timeout: Duration,
+) -> Result<crate::torchftpb::clusterd_event_sink_client::ClusterdEventSinkClient<Channel>> {
+    let conn = connect(addr, connect_timeout).await?;
+    Ok(
+        crate::torchftpb::clusterd_event_sink_client::ClusterdEventSinkClient::new(
+            conn,
+        ),
+    )
 }
 
 impl Manager {
@@ -153,6 +211,10 @@ impl Manager {
                 should_commit_failures: HashSet::new(),
 
                 lighthouse_client: client,
+
+                pending_commands: Vec::new(),
+                executed_commands: std::collections::VecDeque::new(),
+                last_known_step: -1,
             }),
             local_addr,
             listener: Mutex::new(Some(listener)),
@@ -173,8 +235,42 @@ impl Manager {
         Ok(())
     }
 
+    /// Report a fault event upstream to clusterd via the lighthouse relay
+    /// (contract 3). Fire-and-forget from the data plane's perspective: the
+    /// wrapper reports and continues; lighthouse buffers for clusterd.
+    pub async fn report_event(&self, event: FaultEvent) -> Result<()> {
+        // Both services live on the same lighthouse endpoint; the control
+        // client gets its own connection so the quorum channel's client
+        // stays independent.
+        let mut control =
+            lighthouse_control_client_new(self.lighthouse_addr.clone(), self.connect_timeout)
+                .await?;
+        control
+            .report_event(ReportEventRequest { event: Some(event) })
+            .await?;
+        Ok(())
+    }
+
+    /// Drain commands queued by clusterd (contract 8) for the wrapper.
+    pub async fn pop_commands(&self) -> Vec<CommandRequest> {
+        let mut state = self.state.lock().await;
+        std::mem::take(&mut state.pending_commands)
+    }
+
+    fn remember_command_id(state: &mut ManagerState, command_id: &str) {
+        state.executed_commands.push_back(command_id.to_string());
+        while state.executed_commands.len() > COMMAND_ID_MEMO_CAP {
+            state.executed_commands.pop_front();
+        }
+    }
+
     pub fn address(&self) -> String {
         format!("http://{}:{}", self.hostname, self.local_addr.port())
+    }
+
+    /// The full replica_id of this manager incarnation ("{group}:{uuid}").
+    pub fn replica_id(&self) -> String {
+        self.replica_id.clone()
     }
 
     async fn _run_grpc(self: Arc<Self>) -> Result<()> {
@@ -185,7 +281,8 @@ impl Manager {
             TcpIncoming::from_listener(listener, true, None).map_err(|e| anyhow::anyhow!(e))?;
 
         Server::builder()
-            .add_service(ManagerServiceServer::new(self))
+            .add_service(ManagerServiceServer::new(self.clone()))
+            .add_service(ManagerControlServiceServer::new(self))
             .serve_with_incoming(incoming)
             .await
             .map_err(|e| e.into())
@@ -371,6 +468,9 @@ impl ManagerService for Arc<Manager> {
                 commit_failures: req.commit_failures,
             };
             // TODO check step
+            if req.step > state.last_known_step {
+                state.last_known_step = req.step;
+            }
             state.participants.insert(group_rank, member.clone());
             let rx = state.channel.subscribe();
 
@@ -483,6 +583,115 @@ impl ManagerService for Arc<Manager> {
 
         warn!("got kill request: {}", req.msg);
         std::process::exit(1);
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[tonic::async_trait]
+impl ManagerControlService for Arc<Manager> {
+    /// Contract 8 command endpoint (clusterd -> lighthouse -> here). Acks are
+    /// returned on the same path. Accepted means "queued/accepted for
+    /// execution", not "completed": STEP_* commands are consumed by the
+    /// wrapper thin executor through ManagerServer.pop_commands.
+    async fn command(
+        &self,
+        request: Request<ManagerCommandRequest>,
+    ) -> Result<Response<ManagerCommandResponse>, Status> {
+        let command = request
+            .into_inner()
+            .command
+            .ok_or_else(|| Status::invalid_argument("missing command"))?;
+
+        let command_id = command.command_id.clone();
+        let ctype = command.r#type.clone();
+
+        let mut state = self.state.lock().await;
+
+        // Idempotency (contract 8): a re-delivered command_id is acked but
+        // not re-executed.
+        if state.executed_commands.contains(&command_id) {
+            info_with_replica!(
+                self.replica_id,
+                "command {} duplicate ignored",
+                command_id
+            );
+            return Ok(Response::new(ManagerCommandResponse {
+                ack: Some(CommandResponse {
+                    accepted: true,
+                    command_id,
+                    detail: "duplicate ignored".to_string(),
+                    acked_ms: now_ms(),
+                }),
+            }));
+        }
+
+        // WINDOW_MISSED semantics: a command that addresses a step the
+        // manager has already moved past can no longer be applied.
+        if command.step >= 0 && command.step < state.last_known_step {
+            info_with_replica!(
+                self.replica_id,
+                "command {} for step {} rejected: WINDOW_MISSED (last known step {})",
+                command_id,
+                command.step,
+                state.last_known_step
+            );
+            Manager::remember_command_id(&mut state, &command_id);
+            return Ok(Response::new(ManagerCommandResponse {
+                ack: Some(CommandResponse {
+                    accepted: false,
+                    command_id,
+                    detail: "WINDOW_MISSED".to_string(),
+                    acked_ms: now_ms(),
+                }),
+            }));
+        }
+
+        Manager::remember_command_id(&mut state, &command_id);
+
+        match ctype.as_str() {
+            // Contract-8 vocabulary (v5.12): only the two step-level commands
+            // the data plane actually executes. Rebuild/reschedule are
+            // clusterd-local pod lifecycle and never travel here; scale-up is
+            // a lighthouse member instruction (Restore), not a command.
+            "STEP_RETRY" | "STEP_EXCLUDE" => {
+                info_with_replica!(
+                    self.replica_id,
+                    "command {} ({}) queued for wrapper (step {})",
+                    command_id,
+                    ctype,
+                    command.step
+                );
+                state.pending_commands.push(command);
+                Ok(Response::new(ManagerCommandResponse {
+                    ack: Some(CommandResponse {
+                        accepted: true,
+                        command_id,
+                        detail: "queued".to_string(),
+                        acked_ms: now_ms(),
+                    }),
+                }))
+            }
+            other => {
+                warn!(
+                    "[Replica {}] unknown command type {}",
+                    self.replica_id, other
+                );
+                Ok(Response::new(ManagerCommandResponse {
+                    ack: Some(CommandResponse {
+                        accepted: false,
+                        command_id,
+                        detail: format!("unknown command type {}", other),
+                        acked_ms: now_ms(),
+                    }),
+                }))
+            }
+        }
     }
 }
 

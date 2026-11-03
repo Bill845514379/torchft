@@ -7,10 +7,12 @@
 use core::net::SocketAddr;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -25,6 +27,7 @@ use axum::routing::post;
 use gethostname::gethostname;
 use log::error;
 use log::info;
+use log::warn;
 use structopt::StructOpt;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
@@ -38,20 +41,92 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 
 use crate::manager::manager_client_new;
+use crate::manager::manager_control_client_new;
+use crate::torchftpb::CommandRequest;
+use crate::torchftpb::CommandResponse;
+use crate::torchftpb::FaultEvent;
 use crate::torchftpb::KillRequest;
+use crate::torchftpb::lighthouse_control_service_server::LighthouseControlServiceServer;
 use crate::torchftpb::LighthouseHeartbeatRequest;
 use crate::torchftpb::LighthouseHeartbeatResponse;
 use crate::torchftpb::LighthouseQuorumRequest;
 use crate::torchftpb::LighthouseQuorumResponse;
+use crate::torchftpb::ManagerCommandRequest;
+use crate::torchftpb::MemberInstructionRequest;
+use crate::torchftpb::MemberInstructionResponse;
+use crate::torchftpb::ObservationRequest;
+use crate::torchftpb::ObservationResponse;
 use crate::torchftpb::Quorum;
 use crate::torchftpb::QuorumMember;
+use crate::torchftpb::ReplicaObservation;
+use crate::torchftpb::ReportEventRequest;
+use crate::torchftpb::ReportEventResponse;
+use crate::torchftpb::lighthouse_control_service_server::LighthouseControlService;
 use crate::torchftpb::lighthouse_service_server::LighthouseService;
 use crate::torchftpb::lighthouse_service_server::LighthouseServiceServer;
+use crate::torchftpb::PushEventRequest;
+
+/// Number of events buffered for clusterd consumption. Events dropped beyond
+/// this bound are lost to a clusterd that stays down longer than the buffer
+/// can cover; acked events are shed from the head eagerly so the capacity is
+/// spent on undelivered facts only.
+const EVENT_BUFFER_CAPACITY: usize = 4096;
+
+/// Sender-side resend period for un-acked fault events (v5.13 push-ONLY
+/// transport). Deliberately generous: PushEvent folds the event
+/// synchronously -- command dispatch (SendCommand to managers) happens
+/// inside the fold under the engine lock -- so a resend arriving while a
+/// clusterd adjudication is still running would only stack duplicate
+/// pushes behind it. 15s leaves ample room for any single adjudication to
+/// complete; the cost of the slack is that a push-failed event reaches
+/// clusterd at most one period late (fresh events still ride the <1ms
+/// immediate push).
+const EVENT_RESEND_INTERVAL_SECS: u64 = 15;
+
+/// Maximum size of the raw exception string carried in a FaultEvent.
+/// Must not be smaller than the wrapper's _RAW_DETAIL_CAP (16KB,
+/// tail-preserved -- the root cause of an exception chain sits at the
+/// end), otherwise the informative tail the wrapper kept gets chopped
+/// off here.
+const EVENT_DETAIL_MAX_CHARS: usize = 16384;
 
 #[derive(Clone)]
 struct QuorumMemberDetails {
     joined: Instant,
     member: QuorumMember,
+}
+
+/// replica identity: full replica_id is "{group_name}:{uuid}" (see
+/// torchft/manager.py). The group name is the stable identity clusterd
+/// addresses commands at; the uuid disambiguates incarnations after rebuild.
+fn group_of(replica_id: &str) -> String {
+    match replica_id.split_once(':') {
+        Some((group, _)) => group.to_string(),
+        None => replica_id.to_string(),
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Tail-preserve detail down to max bytes: keep the end of the string
+/// with a head-dropped marker (same policy as the wrapper's
+/// _raw_detail). Char-boundary safe.
+fn truncate_detail_tail(detail: &mut String, max: usize) {
+    if detail.len() <= max {
+        return;
+    }
+    let dropped = detail.len() - max;
+    let mut start = detail.len() - (max - 64);
+    while !detail.is_char_boundary(start) {
+        start -= 1;
+    }
+    let tail = detail[start..].to_string();
+    *detail = format!("...({}B head dropped)...\n{}", dropped, tail);
 }
 
 struct State {
@@ -63,6 +138,23 @@ struct State {
     // heartbeat information
     // replica_id -> last heartbeat
     heartbeats: HashMap<String, Instant>,
+
+    // ==== MC-1/MC-9 control plane state ====
+    // event buffer for clusterd (contract 3 upstream relay)
+    events: VecDeque<FaultEvent>,
+    next_event_seq: u64,
+    // seqs acked by clusterd's sink (v5.13 push-only: an acked event is
+    // never resent; un-acked ones are redelivered by the resend sweep)
+    event_acked: HashSet<u64>,
+    // group names excluded by clusterd member instructions
+    excluded: HashSet<String>,
+    // replica_ids seen before -- a never-seen id is a new incarnation
+    // (rejoin after rebuild) and emits a replica_joined event
+    known_replicas: HashSet<String>,
+    // replica groups considered alive at the previous quorum tick
+    last_alive: HashSet<String>,
+    // member instruction ids already applied (idempotency)
+    applied_instructions: HashSet<String>,
 }
 
 pub struct Lighthouse {
@@ -128,6 +220,17 @@ pub struct LighthouseOpt {
         help = "How long to wait for a heartbeat before considering a replica dead."
     )]
     pub heartbeat_timeout_ms: u64,
+
+    // Contract 3 fast path: when set (e.g. http://<node>:29600), every
+    // buffered fault event is pushed fire-and-forget to clusterd's
+    // ClusterdEventSink. Empty (default) disables pushing -- clusterd
+    // then consumes events via the GetEvents pull only.
+    #[structopt(
+        long = "clusterd-addr",
+        default_value = "",
+        help = "clusterd ClusterdEventSink address for event push; empty disables push (pull only)"
+    )]
+    pub clusterd_addr: String,
 }
 
 fn quorum_changed(a: &Vec<QuorumMember>, b: &Vec<QuorumMember>) -> bool {
@@ -155,10 +258,15 @@ fn quorum_compute(
         })
         .collect();
 
+    // MC-9 design rule: a clusterd member instruction can only ever tighten
+    // the quorum. Excluded replicas are dropped from the candidate set no
+    // matter how healthy they look; restore goes through SetMemberList and
+    // then still has to pass the normal heartbeat/majority checks below.
     let healthy_participants: HashMap<&String, &QuorumMemberDetails> = state
         .participants
         .iter()
         .filter(|(replica_id, _details)| healthy_replicas.contains(replica_id))
+        .filter(|(replica_id, _details)| !state.excluded.contains(&group_of(replica_id)))
         .collect();
 
     let mut candidate_participants: Vec<QuorumMember> = healthy_participants
@@ -281,6 +389,13 @@ impl Lighthouse {
                 prev_quorum: None,
                 quorum_id: 0,
                 heartbeats: HashMap::new(),
+                events: VecDeque::new(),
+                next_event_seq: 1,
+                event_acked: HashSet::new(),
+                excluded: HashSet::new(),
+                known_replicas: HashSet::new(),
+                last_alive: HashSet::new(),
+                applied_instructions: HashSet::new(),
             }),
             opt,
             local_addr: listener.local_addr()?,
@@ -290,6 +405,54 @@ impl Lighthouse {
     }
 
     fn _quorum_tick(self: Arc<Self>, state: &mut State) -> Result<()> {
+        // Detect heartbeat-loss transitions and relay them upstream to
+        // clusterd (contract 3): a replica that was alive at the previous
+        // tick and is not anymore is a "heartbeat_loss" event. The exclusion
+        // decision stays with clusterd -- lighthouse only reports the fact.
+        let now = Instant::now();
+        let alive: HashSet<String> = state
+            .heartbeats
+            .iter()
+            .filter(|(_, last)| {
+                now.duration_since(**last) < Duration::from_millis(self.opt.heartbeat_timeout_ms)
+            })
+            .map(|(replica_id, _)| replica_id.clone())
+            .collect();
+        let lost: Vec<String> = state
+            .last_alive
+            .iter()
+            .filter(|replica_id| !alive.contains(*replica_id))
+            .cloned()
+            .collect();
+        for replica_id in lost {
+            info!(
+                "heartbeat lost for replica {}, relaying to clusterd",
+                replica_id
+            );
+            let event = Self::push_event(
+                state,
+                FaultEvent {
+                    seq: 0,
+                    group_rank: 0,
+                    source: "heartbeat_loss".to_string(),
+                    replica_id: replica_id.clone(),
+                    group_name: group_of(&replica_id),
+                    error_class: "HEARTBEAT_LOSS".to_string(),
+                    error_code: String::new(),
+                    window: "none".to_string(),
+                    step: -1,
+                    retry_count: 0,
+                    detail: format!(
+                        "replica {} heartbeat absent for more than {}ms",
+                        replica_id, self.opt.heartbeat_timeout_ms
+                    ),
+                    timestamp_ms: now_ms(),
+                },
+            );
+            Self::spawn_event_push(self.opt.clusterd_addr.clone(), event);
+        }
+        state.last_alive = alive;
+
         let (quorum_met, reason) = quorum_compute(Instant::now(), state, &self.opt);
         self.change_logger.log_if_changed(&reason);
 
@@ -332,6 +495,43 @@ impl Lighthouse {
 
             info!("Quorum! {:?}", quorum);
 
+            // Membership changes are relayed upstream (contract 3
+            // quorum observation): clusterd reconciles its per-replica state
+            // machine against the issued participant set.
+            let groups: Vec<String> = quorum
+                .participants
+                .iter()
+                .map(|p| group_of(&p.replica_id))
+                .collect();
+            if let Some(prev) = &state.prev_quorum {
+                let prev_groups: HashSet<String> =
+                    prev.participants.iter().map(|p| group_of(&p.replica_id)).collect();
+                let current: HashSet<String> = groups.iter().cloned().collect();
+                if prev_groups != current {
+                    let event = Self::push_event(
+                        state,
+                        FaultEvent {
+                            seq: 0,
+                            group_rank: 0,
+                            source: "quorum_change".to_string(),
+                            replica_id: String::new(),
+                            group_name: String::new(),
+                            error_class: "QUORUM_CHANGE".to_string(),
+                            error_code: String::new(),
+                            window: "none".to_string(),
+                            step: -1,
+                            retry_count: 0,
+                            detail: format!(
+                                "quorum {:?} -> {:?} (quorum_id={})",
+                                prev_groups, current, quorum.quorum_id
+                            ),
+                            timestamp_ms: now_ms(),
+                        },
+                    );
+                    Self::spawn_event_push(self.opt.clusterd_addr.clone(), event);
+                }
+            }
+
             state.prev_quorum = Some(quorum.clone());
             state.participants.clear();
             match state.channel.send(quorum) {
@@ -357,6 +557,144 @@ impl Lighthouse {
             gethostname().into_string().unwrap(),
             self.local_addr.port()
         )
+    }
+
+    /// Buffer an event for clusterd consumption (contract 3). seq is
+    /// assigned here; the buffer is bounded, oldest events drop first.
+    /// Returns the seq-assigned event so callers can immediately push it
+    /// to clusterd's sink (the resend sweep covers any push failure).
+    /// Acked events are useless state -- shed them from the head first so
+    /// the capacity serves undelivered facts.
+    fn push_event(state: &mut State, mut event: FaultEvent) -> FaultEvent {
+        event.seq = state.next_event_seq;
+        state.next_event_seq += 1;
+        while state
+            .events
+            .front()
+            .map_or(false, |e| state.event_acked.contains(&e.seq))
+        {
+            state.events.pop_front();
+        }
+        if state.events.len() >= EVENT_BUFFER_CAPACITY {
+            state.events.pop_front();
+        }
+        state.events.push_back(event.clone());
+        event
+    }
+
+    /// Deliver one event to clusterd's event sink and wait for the
+    /// verdict. Ok means the sink processed (or dedup-collapsed) the
+    /// event -- the transport-level ack for the push-ONLY design; Err
+    /// (connect/timeout/Internal) leaves the event un-acked, and the
+    /// resend sweep redelivers it after EVENT_RESEND_INTERVAL_SECS.
+    async fn push_to_clusterd(clusterd_addr: String, event: FaultEvent) -> Result<()> {
+        let mut client = crate::manager::clusterd_event_sink_client_new(
+            clusterd_addr,
+            Duration::from_secs(2),
+        )
+        .await?;
+        let mut req = Request::new(PushEventRequest { event: Some(event) });
+        req.set_timeout(Duration::from_secs(5));
+        client
+            .push_event(req)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
+    }
+
+    /// Fire-and-forget push of a buffered event to clusterd's event sink
+    /// (contract 3 fast path -- sub-ms delivery). Ack bookkeeping is NOT
+    /// done here: the event stays un-acked, and the resend sweep either
+    /// confirms delivery via its own Ok or redelivers; a duplicate
+    /// redelivery collapses on mc1d's per-seq processed dedup. A push
+    /// failure never fails the caller (ReportEvent reply / quorum tick).
+    fn spawn_event_push(clusterd_addr: String, event: FaultEvent) {
+        if clusterd_addr.is_empty() {
+            return;
+        }
+        let seq = event.seq;
+        tokio::spawn(async move {
+            if let Err(e) = Self::push_to_clusterd(clusterd_addr, event).await {
+                warn!(
+                    "event push to clusterd failed (seq {}, resend sweep will redeliver): {}",
+                    seq, e
+                );
+            }
+        });
+    }
+
+    /// Sender-side resend sweep for the push-ONLY event transport: every
+    /// EVENT_RESEND_INTERVAL_SECS, re-push every buffered-but-un-acked
+    /// event; an Ok response acks the seq (never resent again). This is
+    /// the whole failure-recovery story -- mc1d restarts and failed
+    /// pushes are healed by redelivery, no pull path exists.
+    async fn _run_event_resend(self: Arc<Self>) -> Result<()> {
+        let mut ticker = tokio::time::interval(Duration::from_secs(EVENT_RESEND_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let clusterd_addr = self.opt.clusterd_addr.clone();
+            if clusterd_addr.is_empty() {
+                continue;
+            }
+            let pending: Vec<FaultEvent> = {
+                let state = self.state.lock().await;
+                state
+                    .events
+                    .iter()
+                    .filter(|e| !state.event_acked.contains(&e.seq))
+                    .cloned()
+                    .collect()
+            };
+            if pending.is_empty() {
+                continue;
+            }
+            info!(
+                "event resend sweep: {} un-acked event(s) queued for redelivery",
+                pending.len()
+            );
+            for event in pending {
+                let clusterd_addr = clusterd_addr.clone();
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let seq = event.seq;
+                    match Self::push_to_clusterd(clusterd_addr, event).await {
+                        Ok(()) => {
+                            // transport ack: never resend this seq again
+                            this.state.lock().await.event_acked.insert(seq);
+                        }
+                        Err(e) => {
+                            warn!("event resend to clusterd failed (seq {}): {}", seq, e);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// Look up the ManagerServer address of a replica group (most recent
+    /// incarnation seen), for command forwarding (contract 8 downlink).
+    fn manager_address_for(state: &State, group_name: &str) -> Option<String> {
+        let mut best: Option<(Instant, String)> = None;
+        for (replica_id, details) in &state.participants {
+            if group_of(replica_id) == group_name {
+                match &best {
+                    Some((joined, _)) if *joined > details.joined => {}
+                    _ => best = Some((details.joined, details.member.address.clone())),
+                }
+            }
+        }
+        if best.is_none() {
+            // fall back to the last issued quorum
+            if let Some(prev) = &state.prev_quorum {
+                for member in &prev.participants {
+                    if group_of(&member.replica_id) == group_name {
+                        return Some(member.address.clone());
+                    }
+                }
+            }
+        }
+        best.map(|(_, addr)| addr)
     }
 
     async fn _run_grpc(self: Arc<Self>) -> Result<()> {
@@ -387,8 +725,10 @@ impl Lighthouse {
                 }),
             );
 
-        // register the GRPC service
-        let routes = Routes::from(app).add_service(LighthouseServiceServer::new(self));
+        // register the GRPC services
+        let routes = Routes::from(app)
+            .add_service(LighthouseServiceServer::new(self.clone()))
+            .add_service(LighthouseControlServiceServer::new(self));
 
         Server::builder()
             // allow non-GRPC connections
@@ -405,6 +745,8 @@ impl Lighthouse {
         set.spawn(self.clone()._run_quorum());
 
         set.spawn(self.clone()._run_grpc());
+
+        set.spawn(self.clone()._run_event_resend());
 
         while let Some(res) = set.join_next().await {
             res??;
@@ -503,6 +845,35 @@ impl LighthouseService for Arc<Lighthouse> {
                 .heartbeats
                 .insert(requester.replica_id.clone(), Instant::now());
 
+            // A never-seen-before incarnation is a (re)join of the group --
+            // relay it upstream so clusterd can correlate it with an
+            // in-flight rebuild (self-initiated event correlation, plan
+            // section 3.3.6 ruling 4).
+            if !state.known_replicas.contains(&requester.replica_id) {
+                state.known_replicas.insert(requester.replica_id.clone());
+                let event = Lighthouse::push_event(
+                    &mut state,
+                    FaultEvent {
+                        seq: 0,
+                        group_rank: 0,
+                        source: "replica_joined".to_string(),
+                        replica_id: requester.replica_id.clone(),
+                        group_name: group_of(&requester.replica_id),
+                        error_class: "REPLICA_JOINED".to_string(),
+                        error_code: String::new(),
+                        window: "none".to_string(),
+                        step: requester.step,
+                        retry_count: 0,
+                        detail: format!(
+                            "replica {} (group {}) registered with lighthouse",
+                            requester.replica_id, group_of(&requester.replica_id)
+                        ),
+                        timestamp_ms: now_ms(),
+                    },
+                );
+                Lighthouse::spawn_event_push(self.opt.clusterd_addr.clone(), event);
+            }
+
             state.participants.insert(
                 requester.replica_id.clone(),
                 QuorumMemberDetails {
@@ -563,6 +934,318 @@ impl LighthouseService for Arc<Lighthouse> {
 
         let reply = LighthouseHeartbeatResponse {};
         Ok(Response::new(reply))
+    }
+}
+
+#[tonic::async_trait]
+impl LighthouseControlService for Arc<Lighthouse> {
+    async fn report_event(
+        &self,
+        request: Request<ReportEventRequest>,
+    ) -> Result<Response<ReportEventResponse>, Status> {
+        let event = request
+            .into_inner()
+            .event
+            .ok_or_else(|| Status::invalid_argument("missing event"))?;
+
+        let mut state = self.state.lock().await;
+        // Fill the group name from the replica_id when the reporter left
+        // it empty (lighthouse-side context is authoritative).
+        let mut event = event;
+        if event.group_name.is_empty() && !event.replica_id.is_empty() {
+            event.group_name = group_of(&event.replica_id);
+        }
+        truncate_detail_tail(&mut event.detail, EVENT_DETAIL_MAX_CHARS);
+        info!(
+            "buffering fault event seq->{} source={} group={} class={} step={}",
+            state.next_event_seq, event.source, event.group_name, event.error_class, event.step
+        );
+        let event = Lighthouse::push_event(&mut state, event);
+        // Push-ONLY transport (v5.13): the buffered event also goes to
+        // clusterd's sink fire-and-forget. Push failure only warns inside
+        // the spawned task -- ReportEvent always succeeds (the 15s resend
+        // sweep redelivers anything the push drops).
+        Lighthouse::spawn_event_push(self.opt.clusterd_addr.clone(), event);
+
+        Ok(Response::new(ReportEventResponse {}))
+    }
+
+    async fn get_observation(
+        &self,
+        _request: Request<ObservationRequest>,
+    ) -> Result<Response<ObservationResponse>, Status> {
+        let now = Instant::now();
+        let state = self.state.lock().await;
+
+        let max_step = state
+            .heartbeats
+            .keys()
+            .filter_map(|replica_id| state.participants.get(replica_id))
+            .map(|details| details.member.step)
+            .chain(
+                state
+                    .prev_quorum
+                    .as_ref()
+                    .map(|q| q.participants.iter().map(|p| p.step).collect::<Vec<i64>>())
+                    .unwrap_or_default(),
+            )
+            .max()
+            .unwrap_or(-1);
+
+        let mut replicas: Vec<ReplicaObservation> = Vec::new();
+        let in_quorum_groups: HashSet<String> = state
+            .prev_quorum
+            .as_ref()
+            .map(|q| q.participants.iter().map(|p| group_of(&p.replica_id)).collect())
+            .unwrap_or_default();
+
+        let mut seen_groups: HashSet<String> = HashSet::new();
+        // Participants known to lighthouse (most recent incarnation per group)
+        for (replica_id, details) in &state.participants {
+            let group = group_of(replica_id);
+            if !seen_groups.insert(group.clone()) {
+                continue;
+            }
+            let heartbeat_age_ms = state
+                .heartbeats
+                .get(replica_id)
+                .map(|h| now.duration_since(*h).as_millis() as i64)
+                .unwrap_or(-1);
+            replicas.push(ReplicaObservation {
+                replica_id: replica_id.clone(),
+                group_name: group.clone(),
+                address: details.member.address.clone(),
+                in_quorum: in_quorum_groups.contains(&group),
+                heartbeating: heartbeat_age_ms >= 0
+                    && heartbeat_age_ms < self.opt.heartbeat_timeout_ms as i64,
+                excluded: state.excluded.contains(&group),
+                step: details.member.step,
+                heartbeat_age_ms,
+            });
+        }
+        // Groups from the last quorum that no longer participate at all
+        if let Some(prev) = &state.prev_quorum {
+            for member in &prev.participants {
+                let group = group_of(&member.replica_id);
+                if seen_groups.insert(group.clone()) {
+                    let heartbeat_age_ms = state
+                        .heartbeats
+                        .get(&member.replica_id)
+                        .map(|h| now.duration_since(*h).as_millis() as i64)
+                        .unwrap_or(-1);
+                    replicas.push(ReplicaObservation {
+                        replica_id: member.replica_id.clone(),
+                        group_name: group.clone(),
+                        address: member.address.clone(),
+                        in_quorum: false,
+                        // not heartbeating is a fact derived from the
+                        // heartbeat age, not a constant: a replica can be
+                        // outside the pending participant set (quorum
+                        // formation clears it) and still fully alive
+                        heartbeating: heartbeat_age_ms >= 0
+                            && heartbeat_age_ms < self.opt.heartbeat_timeout_ms as i64,
+                        excluded: state.excluded.contains(&group),
+                        step: member.step,
+                        heartbeat_age_ms,
+                    });
+                }
+            }
+        }
+        // Replicas with a fresh heartbeat but no pending registration.
+        // Quorum formation (and member-list churn) clears the pending
+        // participant set; between that and each replica's next quorum()
+        // call the participants map says nothing about liveness. Without
+        // this block the observation reports a fully-heartbeating fleet as
+        // gone, which clusterd's all-replicas-failed rule would act on.
+        for (replica_id, last) in &state.heartbeats {
+            let group = group_of(replica_id);
+            if seen_groups.contains(&group) {
+                continue;
+            }
+            let heartbeat_age_ms = now.duration_since(*last).as_millis() as i64;
+            if heartbeat_age_ms >= self.opt.heartbeat_timeout_ms as i64 {
+                continue;
+            }
+            seen_groups.insert(group.clone());
+            replicas.push(ReplicaObservation {
+                replica_id: replica_id.clone(),
+                group_name: group.clone(),
+                address: String::new(),
+                in_quorum: in_quorum_groups.contains(&group),
+                heartbeating: true,
+                excluded: state.excluded.contains(&group),
+                step: -1,
+                heartbeat_age_ms,
+            });
+        }
+
+        Ok(Response::new(ObservationResponse {
+            quorum_id: state.quorum_id,
+            max_step: max_step,
+            replicas,
+        }))
+    }
+
+    async fn send_command(
+        &self,
+        request: Request<CommandRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        let command = request.into_inner();
+        let target = group_of(&command.target_replica);
+        let command_id = command.command_id.clone();
+
+        let addr = {
+            let state = self.state.lock().await;
+            Lighthouse::manager_address_for(&state, &target)
+        };
+
+        let addr = match addr {
+            Some(addr) if !addr.is_empty() => addr,
+            _ => {
+                warn!(
+                    "command {} target group {} has no known ManagerServer address",
+                    command_id, target
+                );
+                return Ok(Response::new(CommandResponse {
+                    accepted: false,
+                    command_id,
+                    detail: format!("no ManagerServer address known for group {}", target),
+                    acked_ms: now_ms(),
+                }));
+            }
+        };
+
+        let connect_timeout = Duration::from_secs(5);
+        let call_timeout = Duration::from_secs(10);
+        let addr_for_log = addr.clone();
+
+        let result = async move {
+            let mut client =
+                manager_control_client_new(addr, connect_timeout)
+                .await
+                .map_err(|e| Status::from_error(e.into()))?;
+            let mut req = Request::new(ManagerCommandRequest {
+                command: Some(command),
+            });
+            req.set_timeout(call_timeout);
+            client.command(req).await
+        }
+        .await;
+
+        match result {
+            Ok(resp) => {
+                let ack = resp.into_inner().ack.unwrap_or(CommandResponse {
+                    accepted: false,
+                    command_id: command_id.clone(),
+                    detail: "empty ack".to_string(),
+                    acked_ms: now_ms(),
+                });
+                info!(
+                    "command {} forwarded to group {} at {}: accepted={} detail={}",
+                    command_id, target, addr_for_log, ack.accepted, ack.detail
+                );
+                Ok(Response::new(ack))
+            }
+            Err(e) => {
+                warn!(
+                    "command {} forward to group {} at {} failed: {}",
+                    command_id, target, addr_for_log, e
+                );
+                Ok(Response::new(CommandResponse {
+                    accepted: false,
+                    command_id,
+                    detail: format!("forward failed: {}", e),
+                    acked_ms: now_ms(),
+                }))
+            }
+        }
+    }
+
+    async fn set_member_list(
+        &self,
+        request: Request<MemberInstructionRequest>,
+    ) -> Result<Response<MemberInstructionResponse>, Status> {
+        let req = request.into_inner();
+        let instruction_id = req.instruction_id.clone();
+
+        let mut state = self.state.lock().await;
+
+        // Idempotency: re-delivery of the same instruction is a no-op
+        // (MC-9: repeated instruction with the same id must not re-apply).
+        if state.applied_instructions.contains(&instruction_id) {
+            return Ok(Response::new(MemberInstructionResponse {
+                accepted: true,
+                detail: "duplicate instruction ignored".to_string(),
+                quorum_id: state.quorum_id,
+            }));
+        }
+
+        let mut changed = false;
+        for group in req.exclude {
+            if !group.is_empty() && state.excluded.insert(group.clone()) {
+                info!("clusterd excluded group {} from quorum", group);
+                changed = true;
+            }
+        }
+        for group in req.restore {
+            if state.excluded.remove(&group) {
+                info!("clusterd restored group {} to quorum", group);
+                changed = true;
+            }
+        }
+
+        state.applied_instructions.insert(instruction_id.clone());
+        if state.applied_instructions.len() > 1024 {
+            // bound the idempotency memory; old instructions are unlikely to
+            // be re-delivered by then
+            if let Some(first) = state.applied_instructions.iter().next().cloned() {
+                state.applied_instructions.remove(&first);
+            }
+        }
+
+        if changed {
+            // Do NOT clear state.participants here. Managers park inside
+            // their quorum() RPC waiter loop and only re-register when a
+            // broadcast wakes them; a clear with no quorum to broadcast
+            // leaves them parked with their registration deleted and the
+            // quorum can never form again (observed: a healthy booting job
+            // died with a 300s quorum timeout exactly when clusterd's
+            // restore instruction landed). Exclusion/restore are enforced
+            // live by quorum_compute's candidate filter, so the pending
+            // registrations can stay.
+            let excluded_snapshot: Vec<String> =
+                state.excluded.iter().cloned().collect();
+            let event = Lighthouse::push_event(
+                &mut state,
+                FaultEvent {
+                    seq: 0,
+                    group_rank: 0,
+                    source: "quorum_change".to_string(),
+                    replica_id: String::new(),
+                    group_name: String::new(),
+                    error_class: "MEMBER_INSTRUCTION".to_string(),
+                    error_code: String::new(),
+                    window: "none".to_string(),
+                    step: -1,
+                    retry_count: 0,
+                    detail: format!(
+                        "member instruction {} applied, excluded={:?}",
+                        instruction_id, excluded_snapshot
+                    ),
+                    timestamp_ms: now_ms(),
+                },
+            );
+            Lighthouse::spawn_event_push(self.opt.clusterd_addr.clone(), event);
+            self.clone()
+                ._quorum_tick(&mut state)
+                .map_err(|e| Status::from_error(e.into()))?;
+        }
+
+        Ok(Response::new(MemberInstructionResponse {
+            accepted: true,
+            detail: "ok".to_string(),
+            quorum_id: state.quorum_id,
+        }))
     }
 }
 
@@ -640,6 +1323,13 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            events: VecDeque::new(),
+            next_event_seq: 1,
+            event_acked: HashSet::new(),
+            excluded: HashSet::new(),
+            known_replicas: HashSet::new(),
+            last_alive: HashSet::new(),
+            applied_instructions: HashSet::new(),
         };
 
         let now = Instant::now();
@@ -719,6 +1409,13 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            events: VecDeque::new(),
+            next_event_seq: 1,
+            event_acked: HashSet::new(),
+            excluded: HashSet::new(),
+            known_replicas: HashSet::new(),
+            last_alive: HashSet::new(),
+            applied_instructions: HashSet::new(),
         };
 
         let now = Instant::now();
@@ -805,6 +1502,13 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            events: VecDeque::new(),
+            next_event_seq: 1,
+            event_acked: HashSet::new(),
+            excluded: HashSet::new(),
+            known_replicas: HashSet::new(),
+            last_alive: HashSet::new(),
+            applied_instructions: HashSet::new(),
         };
 
         let now = Instant::now();
@@ -895,6 +1599,13 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            events: VecDeque::new(),
+            next_event_seq: 1,
+            event_acked: HashSet::new(),
+            excluded: HashSet::new(),
+            known_replicas: HashSet::new(),
+            last_alive: HashSet::new(),
+            applied_instructions: HashSet::new(),
         };
 
         let now = Instant::now();
@@ -1036,6 +1747,13 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            events: VecDeque::new(),
+            next_event_seq: 1,
+            event_acked: HashSet::new(),
+            excluded: HashSet::new(),
+            known_replicas: HashSet::new(),
+            last_alive: HashSet::new(),
+            applied_instructions: HashSet::new(),
         };
 
         let now = Instant::now();

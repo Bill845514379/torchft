@@ -142,6 +142,115 @@ impl ManagerServer {
             self.handle.abort();
         })
     }
+
+    /// report_event relays a fault event upstream to clusterd via the
+    /// lighthouse (contract 3, wrapper thin executor uplink).
+    ///
+    /// Args:
+    ///     source (str): "wrapper" | "manager"
+    ///     error_class (str): classifier tag; the wrapper leaves it empty
+    ///         (v6 raw-string uplink -- clusterd's ClassifyRaw assigns it)
+    ///     window (str): "pre_collective" | "post_collective" | "none"
+    ///     step (int): training step at capture time
+    ///     retry_count (int): retries already spent on this step
+    ///     detail (str): raw exception string
+    ///     error_code (str): "device error type" hex if any
+    ///     group_rank (int): tp rank within the replica group the fault
+    ///         pertains to (the dead member for member-loss, 0 for
+    ///         rank0-local / unknown)
+    #[pyo3(signature = (source, error_class, window, step, retry_count, detail, error_code=None, group_rank=0))]
+    fn report_event(
+        &self,
+        py: Python<'_>,
+        source: String,
+        error_class: String,
+        window: String,
+        step: i64,
+        retry_count: i32,
+        detail: String,
+        error_code: Option<String>,
+        group_rank: i32,
+    ) -> PyResult<()> {
+        let replica_id = self.manager.replica_id();
+        let event = crate::torchftpb::FaultEvent {
+            seq: 0,
+            source,
+            replica_id: replica_id.clone(),
+            group_name: replica_id.split_once(':').map(|(g, _)| g.to_string()).unwrap_or(replica_id),
+            error_class,
+            error_code: error_code.unwrap_or_default(),
+            window,
+            step,
+            retry_count,
+            detail,
+            group_rank,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        };
+        py.allow_threads(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        self.manager.report_event(event),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("report_event timeout: {e}"))?
+                })
+                .map_err(|e| PyRuntimeError::new_err(format!("{:#}", e)))?;
+            Ok(())
+        })
+    }
+
+    /// pop_commands drains clusterd commands queued at this ManagerServer
+    /// (contract 8 downlink). Returns a list of dicts with keys:
+    /// command_id, type, target_replica, step, max_retries, params (dict),
+    /// issued_ms.
+    ///
+    /// Returns:
+    ///   list[dict]: queued commands (possibly empty)
+    fn pop_commands(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        let commands = py.allow_threads(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.manager.pop_commands(),
+                )
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("pop_commands timeout: {e}")))
+            })
+        })?;
+
+        Python::with_gil(|py| {
+            let out: Vec<Py<PyDict>> = commands
+                .iter()
+                .map(|c| {
+                    let dict = PyDict::new(py);
+                    let _ = dict.set_item("command_id", &c.command_id);
+                    let _ = dict.set_item("type", &c.r#type);
+                    let _ = dict.set_item("target_replica", &c.target_replica);
+                    let _ = dict.set_item("step", c.step);
+                    let _ = dict.set_item("max_retries", c.max_retries);
+                    let _ = dict.set_item("issued_ms", c.issued_ms);
+                    let params = PyDict::new(py);
+                    for kv in &c.params {
+                        let _ = params.set_item(&kv.key, &kv.value);
+                    }
+                    let _ = dict.set_item("params", params);
+                    dict.into()
+                })
+                .collect();
+            Ok(out)
+        })
+    }
 }
 
 /// ManagerClient is a GRPC client to the manager service.
@@ -609,6 +718,8 @@ impl LighthouseClient {
 ///     join_timeout_ms (int): The timeout for joining the quorum.
 ///     quorum_tick_ms (int): The interval at which the quorum is checked.
 ///     heartbeat_timeout_ms (int): The timeout for heartbeats.
+///     clusterd_addr (str): clusterd ClusterdEventSink address for event
+///         push (push-ONLY transport); empty or omitted disables push.
 #[pyclass]
 struct LighthouseServer {
     lighthouse: Arc<lighthouse::Lighthouse>,
@@ -618,7 +729,7 @@ struct LighthouseServer {
 
 #[pymethods]
 impl LighthouseServer {
-    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None))]
+    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None, clusterd_addr=None))]
     #[new]
     fn new(
         py: Python<'_>,
@@ -627,10 +738,12 @@ impl LighthouseServer {
         join_timeout_ms: Option<u64>,
         quorum_tick_ms: Option<u64>,
         heartbeat_timeout_ms: Option<u64>,
+        clusterd_addr: Option<String>,
     ) -> PyResult<Self> {
         let join_timeout_ms = join_timeout_ms.unwrap_or(100);
         let quorum_tick_ms = quorum_tick_ms.unwrap_or(100);
         let heartbeat_timeout_ms = heartbeat_timeout_ms.unwrap_or(5000);
+        let clusterd_addr = clusterd_addr.unwrap_or_default();
 
         py.allow_threads(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -646,6 +759,7 @@ impl LighthouseServer {
                     join_timeout_ms,
                     quorum_tick_ms,
                     heartbeat_timeout_ms,
+                    clusterd_addr,
                 }))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 

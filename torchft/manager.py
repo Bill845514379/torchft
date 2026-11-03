@@ -408,6 +408,61 @@ class Manager:
             self._manager.shutdown()
         self._executor.shutdown(wait=wait)
 
+    def report_fault_event(
+        self,
+        error_class: str,
+        window: str,
+        step: int,
+        retry_count: int = 0,
+        detail: str = "",
+        error_code: Optional[str] = None,
+        source: str = "wrapper",
+        group_rank: int = 0,
+    ) -> None:
+        """
+        Relay a training-domain fault event up to clusterd via the lighthouse
+        (contract 3, wrapper thin executor uplink). Fire-and-forget: lighthouse
+        buffers the event and pushes it to clusterd's sink (sender-side
+        resend until acked); clusterd commands the response.
+
+        Must be called from group rank 0 (the process hosting the
+        ManagerServer). Other ranks relay through their group's rank 0.
+
+        Args:
+            error_class: classifier tag; the wrapper leaves it empty (v6
+                raw-string uplink -- clusterd's ClassifyRaw assigns it)
+            group_rank: tp rank within the replica group the fault pertains
+                to (the dead member for member-loss, 0 for rank0-local)
+            window: "pre_collective" | "post_collective" | "none"
+            step: training step at capture time
+            retry_count: retries already spent on this step
+            detail: raw exception string (truncated by lighthouse)
+            error_code: "device error type" hex if any
+            source: "wrapper" | "manager"
+        """
+        if self._manager is None:
+            raise RuntimeError(
+                "report_fault_event must be called from group rank 0 "
+                "(the process hosting the ManagerServer)"
+            )
+        self._manager.report_event(
+            source, error_class, window, step, retry_count, detail, error_code,
+            group_rank
+        )
+
+    def pop_commands(self) -> List[dict]:
+        """
+        Drain clusterd commands queued at this replica group's ManagerServer
+        (contract 8 downlink, wrapper thin executor consumption).
+
+        Returns:
+            list of dicts: command_id, type, target_replica, step,
+            max_retries, params, issued_ms
+        """
+        if self._manager is None:
+            return []
+        return self._manager.pop_commands()
+
     @torch.profiler.record_function("torchft::manager::allreduce")
     def allreduce(
         self,

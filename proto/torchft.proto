@@ -121,6 +121,171 @@ message KillRequest {
 }
 message KillResponse {}
 
+// ===========================================================================
+// MC-1/MC-9 control plane (contract ③ upstream events + contract ⑧ commands)
+//
+// Topology (plan v5.11, ASCEND_100K_FT_TRAINING_PLAN_CLUSTERD.md):
+//   upstream:   wrapper/Manager -> lighthouse (ReportEvent) -> clusterd
+//               (ClusterdEventSink.PushEvent, push-only + sender-side resend)
+//   observation: clusterd -> lighthouse (GetObservation)
+//   downstream:  clusterd -> lighthouse (SendCommand) -> ManagerServer
+//                (ManagerControlService.Command), ack returned the same path
+//   membership:  clusterd -> lighthouse (SetMemberList), quorum_id bumping is
+//                done by lighthouse itself (MC-9 design rule: lighthouse only
+//                ever tightens, never loosens -- restore still has to pass the
+//                normal heartbeat/majority checks in quorum_compute)
+// ===========================================================================
+
+// Key/value parameter entry (used instead of a map to keep the wire format
+// friendly to minimal hand-rolled encoders on the Go/clusterd side).
+message KV {
+  string key = 1;
+  string value = 2;
+}
+
+// A fault / lifecycle event relayed by lighthouse up to clusterd (contract 3).
+//
+// source:
+//   "wrapper"         wrapper caught a training-domain exception (has window
+//                     context; clusterd runs the fault_handles decision table)
+//   "manager"         ManagerServer originated event (e.g. fatal PG error)
+//   "heartbeat_loss"  lighthouse detected a replica heartbeat timeout
+//   "replica_joined"  a replica registered/registered again with lighthouse
+//   "quorum_change"   the issued quorum membership changed
+//   "conservation"    active-count conservation rule event (spare promote /
+//                     return bookkeeping, v5.10)
+message FaultEvent {
+  uint64 seq = 1;              // assigned by lighthouse when buffered
+  string source = 2;
+  string replica_id = 3;       // full replica_id ("name:uuid")
+  string group_name = 4;       // replica identity prefix ("0", "1", ...)
+  string error_class = 5;      // classifier tag; empty on the wrapper's v6
+                               // raw-string uplink (clusterd ClassifyRaw
+                               // assigns); lighthouse-generated events
+                               // use e.g. "HEARTBEAT_LOSS"
+  string error_code = 6;       // "device error type" hex, if any
+  string window = 7;           // "pre_collective" | "post_collective" | "none"
+  int64 step = 8;
+  int32 retry_count = 9;
+  string detail = 10;          // raw exception string (tail-preserved,
+                               // 16KB cap)
+  int64 timestamp_ms = 11;     // event creation time (epoch ms)
+  int32 group_rank = 12;       // tp rank within the replica group the fault
+                               // pertains to (0 = rank0-local / unknown)
+}
+
+message ReportEventRequest {
+  FaultEvent event = 1;
+}
+message ReportEventResponse {}
+
+// Contract 3 upstream: quorum observation snapshot for clusterd.
+message ObservationRequest {}
+message ReplicaObservation {
+  string replica_id = 1;       // full replica_id of the last quorum request
+  string group_name = 2;
+  string address = 3;          // ManagerServer address (empty if never joined)
+  bool in_quorum = 4;          // in the last issued quorum
+  bool heartbeating = 5;       // heartbeat younger than heartbeat_timeout_ms
+  bool excluded = 6;           // excluded by a clusterd member instruction
+  int64 step = 7;              // last reported step (from participants map)
+  int64 heartbeat_age_ms = 8;  // ms since last heartbeat (-1 = never)
+}
+message ObservationResponse {
+  int64 quorum_id = 1;
+  int64 max_step = 2;
+  repeated ReplicaObservation replicas = 3;
+}
+
+// Contract 8 command (clusterd -> lighthouse -> target ManagerServer).
+//
+// type vocabulary (v5.12): only the two step-level commands the data plane
+// actually executes. The full failure-handling vocabulary is three
+// semantics, one per decision kind:
+//   步重算 STEP_RETRY    pre-collective in-place step recompute (retry budget
+//                        in max_retries; execution mode 1/2 decided by the
+//                        executor from the PG clean/dirty state)
+//   缩容   STEP_EXCLUDE  ordered exit from the current step contribution
+//                        (alive-but-faulty target); a dead replica is
+//                        excluded out-of-band by the Exclude member
+//                        instruction to lighthouse
+//   扩容   Restore       lighthouse member instruction (NOT a command): adds
+//                        the rebuilt replica back to the quorum candidates;
+//                        the next start_quorum re-forms with it and heals
+//
+// Deliberately NOT commands (clusterd-local pod lifecycle, v5.12):
+// restart/reschedule are decided and executed by clusterd itself (the target
+// of a restart is by definition not trusted to execute it); torchft only
+// senses them via heartbeat loss / replica_joined. PROMOTE_SPARE/
+// JOIN_AS_SPARE/FUSE/STEP_REDRAW/RESCHEDULE/RECOVER_REBUILD all absent.
+message CommandRequest {
+  string command_id = 1;       // uuid, idempotency key
+  string type = 2;
+  string target_replica = 3;   // group_name the command addresses
+  int64 step = 4;              // training step the command applies to
+  int32 max_retries = 5;
+  repeated KV params = 6;
+  int64 issued_ms = 7;         // clusterd issue timestamp (round-trip latency)
+}
+
+message CommandResponse {
+  bool accepted = 1;
+  string command_id = 2;
+  string detail = 3;           // "WINDOW_MISSED" / reason strings
+  int64 acked_ms = 4;          // execution-time timestamp (epoch ms)
+}
+
+// MC-9 route 2: membership instruction. Lighthouse applies the exclusion /
+// restore list and lets the normal quorum_id bumping take effect. Re-delivery
+// of an identical instruction is idempotent.
+message MemberInstructionRequest {
+  string instruction_id = 1;   // uuid, idempotency key
+  repeated string exclude = 2; // group names to exclude from quorum
+  repeated string restore = 3; // group names to restore
+}
+message MemberInstructionResponse {
+  bool accepted = 1;
+  string detail = 2;
+  int64 quorum_id = 3;
+}
+
+// Served by lighthouse, consumed by clusterd (MC-1) and by the data plane
+// (ReportEvent, W6 wrapper thin executor via ManagerServer).
+service LighthouseControlService {
+  rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+  rpc GetObservation(ObservationRequest) returns (ObservationResponse);
+  rpc SendCommand(CommandRequest) returns (CommandResponse);
+  rpc SetMemberList(MemberInstructionRequest) returns (MemberInstructionResponse);
+}
+
+// Contract 3 event transport (push-ONLY): clusterd's MC-1 sidecar
+// (mc1d) hosts this sink service and lighthouse pushes every buffered
+// fault event right after buffering it. v5.13: push-ONLY transport --
+// lighthouse resends an event until mc1d's sink acks it (sender-side
+// retry, 15s sweep: the interval deliberately leaves room for a clusterd
+// adjudication already in flight); there is no GetEvents pull in the
+// event path anymore. Duplicate redeliveries collapse on mc1d's per-seq
+// processed dedup. A push failure only
+// warns in lighthouse -- it never fails ReportEvent.
+message PushEventRequest {
+  FaultEvent event = 1;
+}
+message PushEventResponse {}
+service ClusterdEventSink {
+  rpc PushEvent(PushEventRequest) returns (PushEventResponse);
+}
+
+// ManagerServer command RPC (W6, contract 8 endpoint on the data plane).
+message ManagerCommandRequest {
+  CommandRequest command = 1;
+}
+message ManagerCommandResponse {
+  CommandResponse ack = 1;
+}
+service ManagerControlService {
+  rpc Command(ManagerCommandRequest) returns (ManagerCommandResponse);
+}
+
 service ManagerService {
   rpc Quorum(ManagerQuorumRequest) returns (ManagerQuorumResponse);
   rpc CheckpointMetadata(CheckpointMetadataRequest)
