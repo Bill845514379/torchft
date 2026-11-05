@@ -1028,46 +1028,45 @@ class ProcessGroupXCCL(ProcessGroupWrapper):
 
 class ProcessGroupHCCL(ProcessGroupWrapper):
     """
-    This is a reconfigurable version of ProcessGroupHCCL for Ascend NPU devices.
-
-    Recovery design follows the W0 HCCL fault-tolerance probe verdict
-    ("verdict B"): ``abort_hccl_comm`` cannot unblock in-flight collectives,
-    so the primary recovery mechanism is a bounded user-space wait (the
-    context timeout in ``_run_context``) -> mark the PG errored -> abandon the
-    collective -> reconfigure the PG on a new store prefix. ``abort()`` is
-    only used for best-effort corpse collection of the abandoned HCCL comm
-    (W0 P5: reclaims ~413MB per comm, equivalent to dropping the reference).
-
-    HARD CONSTRAINT (W0 P5): the abandoned ProcessGroup must not be retained
-    by any global reference or the process can no longer create new PGs.
-    ``configure()`` replaces ``self._pg`` which drops the last reference to
-    the old PG and triggers reclamation.
-
-    The HCCL watchdog is stopped on the backend (W0 probe1: with the watchdog
-    running it kills the process on its own timeout, racing torchft's
-    user-space bounded wait). torchft fully owns the timeout.
-
-    Args:
-        timeout: the timeout to use for HCCL operations.
+    Reconfigurable HCCL process group for Ascend NPU devices.
     """
 
-    def __init__(self, timeout: timedelta = timedelta(seconds=60.0)) -> None:
+    def __init__(
+        self,
+        timeout: timedelta = timedelta(seconds=60.0),
+        recovery_timeout: timedelta|None = None,
+        warmup_timeout: timedelta|None = None,
+    ) -> None:
         super().__init__(timeout)
-        # W0 verdict B: abort cannot unblock in-flight work on HCCL. Keep the
-        # NCCL-style abort-driven recovery off by default; the knob is kept
-        # for future torch_npu versions that may grow a working abort.
         self._use_abort: bool = (
             os.environ.get("TORCHFT_HCCL_USE_ABORT", "false") == "true"
         )
-
         self._errored: Optional[Exception] = None
+        self.recovery: Any = None
+
+        if not self._use_abort:
+            from torchft.hccl_recovery import HcclRecovery
+
+            self.recovery = HcclRecovery(
+                timeout,
+                recovery_timeout=recovery_timeout or timeout,
+                warmup_timeout=warmup_timeout,
+                get_process_group=self._get_process_group,
+                clear_process_group=self._clear_process_group,
+            )
+
+    def _get_process_group(self) -> Optional[BaseProcessGroup]:
+        return self._pg
+
+    def _clear_process_group(self, pg: BaseProcessGroup) -> None:
+        if self._pg is pg:
+            self._pg = None
 
     def _opts_hook(self, opts: T) -> T:
         if not self._use_abort:
             return opts
 
-        # We need to clear the timeout to apply our own timeout that doesn't
-        # crash the whole program.
+        # Legacy abort-only path: clear the timeout so torchft owns the error.
         if hasattr(opts, "timeout"):
             # apply default timeout to disable
             # pyrefly: ignore [missing-attribute]
@@ -1076,7 +1075,7 @@ class ProcessGroupHCCL(ProcessGroupWrapper):
 
     def _wrap_work(self, work: Work, opts: object) -> Work:
         if not self._use_abort:
-            return work
+            return self.recovery.wrap_work(self, work, opts)
 
         timeout = self._timeout
         # pyre-fixme[16]: no attribute timeout
@@ -1086,6 +1085,11 @@ class ProcessGroupHCCL(ProcessGroupWrapper):
 
     @contextmanager
     def _run_context(self) -> Generator[None, None, None]:
+        if not self._use_abort:
+            with self.recovery.track_collective():
+                yield
+            return
+
         timeout: timedelta = self._timeout
 
         def callback() -> None:
@@ -1098,6 +1102,62 @@ class ProcessGroupHCCL(ProcessGroupWrapper):
         with context_timeout(callback, timeout):
             yield
 
+    def configure(
+        self,
+        store_addr: str,
+        replica_id: str,
+        rank: int,
+        world_size: int,
+        quorum_id: Optional[int] = None,
+        group_rank: Optional[int] = None,
+        group_world_size: Optional[int] = None,
+        global_ranks: Optional[list[int]] = None,
+    ) -> None:
+        if self._use_abort:
+            super().configure(
+                store_addr,
+                replica_id,
+                rank,
+                world_size,
+                quorum_id,
+                group_rank,
+                group_world_size,
+                global_ranks,
+            )
+            return
+
+        # The HCCL backend does not implement c10d's ProcessGroup.configure, so
+        # replace the old PG with a fresh one instead of reusing it in place.
+        self._replica_id = replica_id
+        self._quorum_id = quorum_id
+        self._group_rank = group_rank
+        self._group_world_size = group_world_size
+        self._rank = rank
+        self._global_ranks = global_ranks
+
+        if self._pg is not None:
+            self.abort(errored=False)
+
+            # Force the old c10d PG destructor / HcclCommDestroy to run now
+            # instead of deferring it to a later GC pass that races the new
+            # communicator initialization.
+            import gc
+
+            gc.collect()
+
+        # HCCL server/port teardown is asynchronous. Align all ranks in the
+        # "old comm destroyed, new comm not created" window before creating the
+        # new communicator to avoid EI0015 "no rank can connect to the root
+        # node". This also applies to fresh processes so their init is aligned
+        # with a reconfiguring peer.
+        settle = float(os.environ.get("TORCHFT_HCCL_RECONFIGURE_SETTLE_S", "5.0"))
+        if settle > 0:
+            logger.info(f"HCCL reconfigure: waiting {settle}s for comm init alignment")
+            time.sleep(settle)
+
+        store = create_store_client(store_addr, timeout=self._timeout)
+        self._pg = self._create_pg(store, rank, world_size)
+
     def _create_pg(self, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
         # pyre-fixme[21]: no attribute ProcessGroupHCCL
         from torch_npu._C._distributed_c10d import (
@@ -1105,39 +1165,42 @@ class ProcessGroupHCCL(ProcessGroupWrapper):
         )
 
         self._errored = None
+        if not self._use_abort:
+            self.recovery.prepare_group(torch.accelerator.current_device_index())
 
         # pyre-fixme[16]: no attribute ProcessGroupHCCL
         opts = BaseProcessGroupHCCL.Options()
-        # HCCL Options has no config.blocking (W0 probe0 inventory); the
-        # timeout lives directly on the Options object.
-        # pyrefly: ignore [missing-attribute]
-        opts._timeout = self._timeout
+        opts._timeout = (
+            self.recovery.watchdog_timeout if not self._use_abort else self._timeout
+        )
         if self._global_ranks:
             opts.global_ranks_in_group = self._global_ranks
         if self._group_rank and self._group_world_size:
-            # pyrefly: ignore [bad-assignment]
-            opts.group_name = f"torchft_quorum_{self._quorum_id}_rank_{self._group_rank % self._group_world_size}"
+            opts.group_name = (
+                f"torchft_quorum_{self._quorum_id}_rank_"
+                f"{self._group_rank % self._group_world_size}"
+            )
 
         pg = BaseProcessGroup(store, rank, world_size)
-        # HCCL PGs register as a CUSTOM backend type in torch_npu
         pg._set_default_backend(ProcessGroup.BackendType.CUSTOM)
-        # pyre-fixme[16]: no attribute ProcessGroupHCCL
         backend_class = BaseProcessGroupHCCL(store, rank, world_size, opts)
         backend_class._set_sequence_number_for_group()
 
-        # Stop the HCCL watchdog: it would kill the process on its own
-        # timeout (W0 probe1), racing torchft's user-space bounded wait.
-        # torchft owns the timeout entirely.
+        # Stop the HCCL watchdog: torchft owns the timeout and recovery.
         try:
             from torch_npu.npu._recovery import WATCHDOG_STATUS_STOP
 
             backend_class.set_watchdog_status(WATCHDOG_STATUS_STOP)
         except Exception as e:
-            logger.warning(f"failed to stop HCCL watchdog, relying on it for timeout: {e}")
+            logger.warning(
+                f"failed to stop HCCL watchdog, relying on it for timeout: {e}"
+            )
 
         pg._register_backend(
             torch.device("npu"), ProcessGroup.BackendType.CUSTOM, backend_class
         )
+        if not self._use_abort:
+            self.recovery.group_created()
         return pg
 
     def abort(self, errored: bool = True) -> None:
@@ -1157,13 +1220,65 @@ class ProcessGroupHCCL(ProcessGroupWrapper):
                     backend.abort_hccl_comm("reinit")
                 except Exception as e:
                     logger.warning(f"HCCL abort (corpse collection) failed: {e}")
+            super().abort(errored=errored)
+            return
 
-        super().abort(errored=errored)
+        with self.recovery.release_group(errored=errored) as pg:
+            if pg is not None:
+                backend = cast("Any", pg._get_backend(torch.device("npu")))
+                backend.abort()
+                backend.shutdown()
+                backend.clear_workmeta_list()
+
+    def shutdown(self) -> None:
+        if self._use_abort:
+            super().shutdown()
+            return
+        with self.recovery.release_group(errored=False) as pg:
+            if pg is not None:
+                backend = cast("Any", pg._get_backend(torch.device("npu")))
+                backend.shutdown()
 
     def errored(self) -> Optional[Exception]:
-        # force a synchronization to ensure all work is complete
+        if not self._use_abort:
+            return self.recovery.errored() or self._errored
         synchronize()
         return self._errored
+
+    def wait_for_completion(self, work: Work) -> None:
+        if not self._use_abort:
+            self.recovery.wait_for_completion(work)
+            return
+        if not work.wait():
+            raise RuntimeError("HCCL work did not complete")
+
+    @property
+    def recovery_generation(self) -> int:
+        """Number of successful device recoveries completed by this group."""
+        if self.recovery is None:
+            return 0
+        return self.recovery.recovery_generation
+
+    def force_recover(self, recovery_generation: int | None = None) -> Any:
+        """Force device recovery after a peer-loss event"""
+        if self._use_abort:
+            from torchft.hccl_recovery import RecoveryResult
+
+            return RecoveryResult.UNSUPPORTED
+        return self.recovery.force_recover(recovery_generation)
+
+    def recover(self, error: Exception) -> bool:
+        if self._use_abort:
+            return False
+        return self.recovery.recover(error)
+
+    def begin_attempt(self) -> None:
+        if not self._use_abort:
+            self.recovery.begin_attempt()
+
+    def apply_optimizer(self, update: Any) -> None:
+        if not self._use_abort:
+            self.recovery.apply_optimizer(update)
 
     def barrier(self, opts: Optional[BarrierOptions] = None) -> Work:
         # c10d's default barrier resolves the device from BarrierOptions and
