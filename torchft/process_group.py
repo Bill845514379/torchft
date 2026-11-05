@@ -1640,7 +1640,10 @@ class ManagedProcessGroup(ProcessGroupWrapper):
         assert False, "unreachable"
 
     def size(self) -> int:
-        return self._manager.num_participants()
+        # FSDP2 queries this on every micro-batch's reduce-scatter, not only
+        # on the one that all-reduces; with a plan function registered it
+        # must not wait for PG reconfiguration and healing
+        return self._manager._plan_num_participants()
 
     def getBackendName(self) -> str:
         return self._manager._pg.getBackendName()

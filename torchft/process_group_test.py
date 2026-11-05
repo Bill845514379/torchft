@@ -782,7 +782,7 @@ class ProcessGroupTest(TestCase):
         manager.errored.return_value = None
         manager._pg = ProcessGroupDummy(0, 1)
         pg = ManagedProcessGroup(manager)
-        manager.num_participants.return_value = 123
+        manager._plan_num_participants.return_value = 123
 
         self.assertEqual(pg.size(), 123)
 
