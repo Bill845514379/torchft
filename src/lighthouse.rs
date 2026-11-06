@@ -155,6 +155,16 @@ struct State {
     last_alive: HashSet<String>,
     // member instruction ids already applied (idempotency)
     applied_instructions: HashSet<String>,
+    // commanded-shrink (v6.3): replica_ids that have ever been committed
+    // into a quorum. A member that was quorate and then loses heartbeat
+    // is "lame" -- its exit must wait for a clusterd member instruction
+    // instead of silently dropping out of the candidate set.
+    quorate_seen: HashSet<String>,
+    // commanded-shrink (v6.3): true while the formation is frozen (lame
+    // member present, waiting for SetMemberList). quorum() waiters poll
+    // this to return a structured pending response (no string matching
+    // anywhere downstream).
+    pending_decision: bool,
 }
 
 pub struct Lighthouse {
@@ -220,6 +230,18 @@ pub struct LighthouseOpt {
         help = "How long to wait for a heartbeat before considering a replica dead."
     )]
     pub heartbeat_timeout_ms: u64,
+
+    // commanded-shrink (v6.3): heartbeat-lost members that were ever
+    // quorate do NOT silently drop out; formation freezes until clusterd's
+    // SetMemberList exclude removes them. clusterd is the single shrink
+    // authority (I1); Managers park in their quorum() waiter meanwhile (I2).
+    #[structopt(
+        long = "commanded-shrink",
+        parse(try_from_str),
+        default_value = "false",
+        help = "Freeze quorum formation on lame members pending clusterd decision"
+    )]
+    pub commanded_shrink: bool,
 
     // Contract 3 fast path: when set (e.g. http://<node>:29600), every
     // buffered fault event is pushed fire-and-forget to clusterd's
@@ -288,6 +310,29 @@ fn quorum_compute(
         healthy_replicas.len(),
         shrink_only,
     );
+
+    // commanded-shrink freeze gate (v6.3): a member that was ever quorate
+    // and lost heartbeat does NOT silently drop out. Formation stays
+    // failed until clusterd's member instruction (SetMemberList exclude)
+    // removes it from the candidate set; Managers park in their quorum()
+    // waiter meanwhile. New pods that never joined a quorum are exempt
+    // (I3: boot storm must not wait for clusterd).
+    if opt.commanded_shrink {
+        let lame: Vec<String> = state
+            .participants
+            .keys()
+            .filter(|id| !healthy_replicas.contains(*id))
+            .filter(|id| state.quorate_seen.contains(*id))
+            .filter(|id| !state.excluded.contains(&group_of(id)))
+            .cloned()
+            .collect();
+        if !lame.is_empty() {
+            return (
+                None,
+                format!("PENDING_CLUSTERD_DECISION: lame members {:?}", lame),
+            );
+        }
+    }
 
     // Check if we can use the previous quorum.
     // TODO: do we still need this given we have heartbeats?
@@ -396,6 +441,8 @@ impl Lighthouse {
                 known_replicas: HashSet::new(),
                 last_alive: HashSet::new(),
                 applied_instructions: HashSet::new(),
+                quorate_seen: HashSet::new(),
+                pending_decision: false,
             }),
             opt,
             local_addr: listener.local_addr()?,
@@ -455,6 +502,12 @@ impl Lighthouse {
 
         let (quorum_met, reason) = quorum_compute(Instant::now(), state, &self.opt);
         self.change_logger.log_if_changed(&reason);
+        // commanded-shrink (v6.3): publish the freeze state for quorum()
+        // waiters -- they poll-wake on it and return the structured
+        // pending response instead of parking to their deadline.
+        state.pending_decision = self.opt.commanded_shrink
+            && quorum_met.is_none()
+            && reason.starts_with("PENDING_CLUSTERD_DECISION");
 
         if quorum_met.is_some() {
             let participants = quorum_met.unwrap();
@@ -532,6 +585,11 @@ impl Lighthouse {
                 }
             }
 
+            // commanded-shrink (v6.3): record who has ever been quorate
+            // (lame-member gate only applies to former participants).
+            for p in &quorum.participants {
+                state.quorate_seen.insert(p.replica_id.clone());
+            }
             state.prev_quorum = Some(quorum.clone());
             state.participants.clear();
             match state.channel.send(quorum) {
@@ -891,8 +949,47 @@ impl LighthouseService for Arc<Lighthouse> {
             rx
         };
 
+        // commanded-shrink (v6.3): the formation may be frozen pending a
+        // clusterd decision -- no broadcast will come until SetMemberList
+        // lands. Return the structured pending response so the Manager
+        // holds internally (I2) instead of surfacing a timeout that would
+        // poison the wrapper's adjudication (R1).
+        if self.state.lock().await.pending_decision {
+            info!(
+                "Replica {} held: quorum formation pending clusterd decision",
+                &requester.replica_id
+            );
+            return Ok(Response::new(LighthouseQuorumResponse {
+                quorum: None,
+                pending_clusterd_decision: true,
+            }));
+        }
+
         let quorum = loop {
-            let current_quorum = rx.recv().await.map_err(|e| Status::from_error(e.into()))?;
+            // poll-wake: a frozen formation never broadcasts, so a plain
+            // recv() would park past the freeze -- wake every 1s and
+            // re-check (freeze may also begin while already parked).
+            let current_quorum = match tokio::time::timeout(
+                Duration::from_millis(1000),
+                rx.recv(),
+            )
+            .await
+            {
+                Ok(res) => res.map_err(|e| Status::from_error(e.into()))?,
+                Err(_elapsed) => {
+                    if self.state.lock().await.pending_decision {
+                        info!(
+                            "Replica {} held: quorum formation pending clusterd decision",
+                            &requester.replica_id
+                        );
+                        return Ok(Response::new(LighthouseQuorumResponse {
+                            quorum: None,
+                            pending_clusterd_decision: true,
+                        }));
+                    }
+                    continue;
+                }
+            };
 
             if current_quorum
                 .participants
@@ -916,6 +1013,7 @@ impl LighthouseService for Arc<Lighthouse> {
 
         let reply = LighthouseQuorumResponse {
             quorum: Some(quorum),
+            pending_clusterd_decision: false,
         };
 
         Ok(Response::new(reply))
@@ -1307,14 +1405,23 @@ mod tests {
         Ok(LighthouseServiceClient::new(conn))
     }
 
-    #[tokio::test]
-    async fn test_quorum_join_timeout() -> Result<()> {
+
+    // commanded-shrink (v6.3): the lame-member freeze gate. A member that
+    // was ever quorate and loses heartbeat must NOT silently drop out --
+    // formation returns None with the stable PENDING_CLUSTERD_DECISION
+    // marker until clusterd's SetMemberList exclude removes it (I1/I2).
+    // Members never quorate are exempt (I3); excluded members leave the
+    // candidate set via the normal filter and unblock formation.
+    #[test]
+    fn test_quorum_freeze_pending_clusterd_decision() {
         let opt = LighthouseOpt {
+            commanded_shrink: true,
             min_replicas: 1,
             bind: "[::]:0".to_string(),
-            join_timeout_ms: 60 * 60 * 1000, // 1hr
+            join_timeout_ms: 60 * 60 * 1000,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
 
         let mut state = State {
@@ -1330,6 +1437,92 @@ mod tests {
             known_replicas: HashSet::new(),
             last_alive: HashSet::new(),
             applied_instructions: HashSet::new(),
+            quorate_seen: HashSet::new(),
+            pending_decision: false,
+        };
+
+        let now = Instant::now();
+        let member = |id: &str| QuorumMemberDetails {
+            joined: now,
+            member: QuorumMember {
+                replica_id: id.to_string(),
+                address: "".to_string(),
+                store_address: "".to_string(),
+                step: 1,
+                world_size: 1,
+                shrink_only: false,
+                data: String::new(),
+                commit_failures: 0,
+            },
+        };
+
+        // two healthy participants
+        for id in ["a", "b"] {
+            state.participants.insert(id.to_string(), member(id));
+            state.heartbeats.insert(id.to_string(), now);
+        }
+        let (quorum_met, reason) = quorum_compute(now, &state, &opt);
+        assert!(quorum_met.is_some(), "{}", reason);
+
+        // both ever-quorate now
+        state.quorate_seen.insert("a".to_string());
+        state.quorate_seen.insert("b".to_string());
+
+        // b loses heartbeat: commanded mode must FREEZE, not auto-shrink
+        state.heartbeats.remove("b");
+        let (quorum_met, reason) = quorum_compute(now, &state, &opt);
+        assert!(quorum_met.is_none(), "{}", reason);
+        assert!(
+            reason.starts_with("PENDING_CLUSTERD_DECISION"),
+            "{}",
+            reason
+        );
+        assert!(reason.contains("\"b\""), "{}", reason);
+
+        // never-quorate stragglers are exempt (I3): a member that never
+        // joined a quorum losing heartbeat does not freeze formation
+        state.heartbeats.insert("b".to_string(), now);
+        state.quorate_seen.remove("b");
+        let (quorum_met, reason) = quorum_compute(now, &state, &opt);
+        assert!(quorum_met.is_some(), "{}", reason);
+
+        // clusterd exclude lands: b leaves via the excluded filter,
+        // formation unblocks (I1 -- the only shrink path)
+        state.quorate_seen.insert("b".to_string());
+        state.heartbeats.remove("b");
+        state.excluded.insert(group_of("b"));
+        let (quorum_met, reason) = quorum_compute(now, &state, &opt);
+        assert!(quorum_met.is_some(), "{}", reason);
+        assert_eq!(quorum_met.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_quorum_join_timeout() -> Result<()> {
+        let opt = LighthouseOpt {
+            commanded_shrink: false,
+            min_replicas: 1,
+            bind: "[::]:0".to_string(),
+            join_timeout_ms: 60 * 60 * 1000, // 1hr
+            quorum_tick_ms: 10,
+            heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
+        };
+
+        let mut state = State {
+            channel: broadcast::channel(16).0,
+            participants: HashMap::new(),
+            prev_quorum: None,
+            quorum_id: 0,
+            heartbeats: HashMap::new(),
+            events: VecDeque::new(),
+            next_event_seq: 1,
+            event_acked: HashSet::new(),
+            excluded: HashSet::new(),
+            known_replicas: HashSet::new(),
+            last_alive: HashSet::new(),
+            applied_instructions: HashSet::new(),
+            quorate_seen: HashSet::new(),
+            pending_decision: false,
         };
 
         let now = Instant::now();
@@ -1396,11 +1589,13 @@ mod tests {
     #[tokio::test]
     async fn test_quorum_heartbeats() -> Result<()> {
         let opt = LighthouseOpt {
+            commanded_shrink: false,
             min_replicas: 1,
             bind: "[::]:0".to_string(),
             join_timeout_ms: 0,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
 
         let mut state = State {
@@ -1416,6 +1611,8 @@ mod tests {
             known_replicas: HashSet::new(),
             last_alive: HashSet::new(),
             applied_instructions: HashSet::new(),
+            quorate_seen: HashSet::new(),
+            pending_decision: false,
         };
 
         let now = Instant::now();
@@ -1489,11 +1686,13 @@ mod tests {
     #[tokio::test]
     async fn test_quorum_fast_prev_quorum() -> Result<()> {
         let opt = LighthouseOpt {
+            commanded_shrink: false,
             min_replicas: 1,
             bind: "[::]:0".to_string(),
             join_timeout_ms: 60 * 60 * 1000, // 1hr
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
 
         let mut state = State {
@@ -1509,6 +1708,8 @@ mod tests {
             known_replicas: HashSet::new(),
             last_alive: HashSet::new(),
             applied_instructions: HashSet::new(),
+            quorate_seen: HashSet::new(),
+            pending_decision: false,
         };
 
         let now = Instant::now();
@@ -1586,11 +1787,13 @@ mod tests {
     #[tokio::test]
     async fn test_quorum_shrink_only() -> Result<()> {
         let opt = LighthouseOpt {
+            commanded_shrink: false,
             min_replicas: 1,
             bind: "[::]:0".to_string(),
             join_timeout_ms: 60 * 60 * 1000, // 1hr
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
 
         let mut state = State {
@@ -1606,6 +1809,8 @@ mod tests {
             known_replicas: HashSet::new(),
             last_alive: HashSet::new(),
             applied_instructions: HashSet::new(),
+            quorate_seen: HashSet::new(),
+            pending_decision: false,
         };
 
         let now = Instant::now();
@@ -1688,11 +1893,13 @@ mod tests {
     #[tokio::test]
     async fn test_lighthouse_e2e() -> Result<()> {
         let opt = LighthouseOpt {
+            commanded_shrink: false,
             min_replicas: 1,
             bind: "[::]:0".to_string(),
             join_timeout_ms: 1,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
         let lighthouse = Lighthouse::new(opt).await?;
 
@@ -1734,11 +1941,13 @@ mod tests {
     #[tokio::test]
     async fn test_quorum_split_brain() -> Result<()> {
         let opt = LighthouseOpt {
+            commanded_shrink: false,
             min_replicas: 1,
             bind: "[::]:0".to_string(),
             join_timeout_ms: 60 * 60 * 1000, // 1hr
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
 
         let mut state = State {
@@ -1754,6 +1963,8 @@ mod tests {
             known_replicas: HashSet::new(),
             last_alive: HashSet::new(),
             applied_instructions: HashSet::new(),
+            quorate_seen: HashSet::new(),
+            pending_decision: false,
         };
 
         let now = Instant::now();
@@ -1851,11 +2062,13 @@ mod tests {
         }
 
         let opt = LighthouseOpt {
+            commanded_shrink: false,
             min_replicas: 2,
             bind: "[::]:0".to_string(),
             join_timeout_ms: 1000,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
 
         // Start the lighthouse service
@@ -1964,11 +2177,13 @@ mod tests {
         }
 
         let opt = LighthouseOpt {
+            commanded_shrink: false,
             min_replicas: 2,
             bind: "[::]:0".to_string(),
             join_timeout_ms: 1000,
             quorum_tick_ms: 10,
             heartbeat_timeout_ms: 5000,
+            clusterd_addr: String::new(),
         };
 
         // Start the lighthouse service

@@ -350,6 +350,9 @@ impl Manager {
         lighthouse_request: LighthouseQuorumRequest,
     ) -> Result<tonic::Response<LighthouseQuorumResponse>, Status> {
         let mut retry_count = 0;
+        // commanded-shrink (v6.3) hold-loop observability
+        let mut hold_started: Option<std::time::Instant> = None;
+        let mut last_hold_log = std::time::Instant::now();
         loop {
             let mut client = {
                 let state = self.state.lock().await;
@@ -364,6 +367,28 @@ impl Manager {
             let mut sleep_time = 100;
             match result {
                 Ok(Ok(response)) => {
+                    // commanded-shrink (v6.3): lighthouse reports the
+                    // formation is frozen pending a clusterd member
+                    // instruction. Hold internally (I2) -- never surface
+                    // this to the wrapper as an error, it would poison
+                    // adjudication (R1). Hold is unbounded (I4: clusterd
+                    // unreachable == all park), observable via the 15s
+                    // hold log. Bypasses the retry cap by design.
+                    if response.get_ref().pending_clusterd_decision {
+                        if hold_started.is_none() {
+                            hold_started = Some(std::time::Instant::now());
+                        }
+                        if last_hold_log.elapsed() >= Duration::from_secs(15) {
+                            info_with_replica!(
+                                self.replica_id,
+                                "quorum hold: pending clusterd decision (held {}s)",
+                                hold_started.unwrap().elapsed().as_secs()
+                            );
+                            last_hold_log = std::time::Instant::now();
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                     return Ok(response);
                 }
                 Ok(Err(e)) => {
@@ -870,6 +895,8 @@ mod tests {
             min_replicas: 1,
             quorum_tick_ms: 100,
             heartbeat_timeout_ms: 5000,
+            commanded_shrink: false,
+            clusterd_addr: String::new(),
         })
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
@@ -918,6 +945,8 @@ mod tests {
             min_replicas: 1,
             quorum_tick_ms: 100,
             heartbeat_timeout_ms: 5000,
+            commanded_shrink: false,
+            clusterd_addr: String::new(),
         })
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
@@ -974,6 +1003,8 @@ mod tests {
             min_replicas: 2,
             quorum_tick_ms: 100,
             heartbeat_timeout_ms: 5000,
+            commanded_shrink: false,
+            clusterd_addr: String::new(),
         })
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
@@ -1047,6 +1078,8 @@ mod tests {
             min_replicas: 1,
             quorum_tick_ms: 100,
             heartbeat_timeout_ms: 5000,
+            commanded_shrink: false,
+            clusterd_addr: String::new(),
         })
         .await?;
         let lighthouse_fut = tokio::spawn(lighthouse.clone().run());
@@ -1356,6 +1389,7 @@ mod tests {
                     quorum_id: 1,
                     created: None,
                 }),
+                pending_clusterd_decision: false,
             }))
         }
 

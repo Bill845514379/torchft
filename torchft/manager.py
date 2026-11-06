@@ -254,6 +254,16 @@ class Manager:
         self._quorum_timeout: timedelta = get_timeout(
             os.environ.get(QUORUM_TIMEOUT_SEC_ENV, None), quorum_timeout
         )
+        # commanded-shrink (v6.3): while the lighthouse formation is frozen
+        # pending a clusterd member instruction, the Manager holds
+        # internally (rust side) -- the quorum() grpc deadline must span
+        # the whole hold or tonic cancels the server handler mid-hold
+        # (hold is transparent to the wrapper, so extend it here).
+        if os.environ.get("FT_QUORUM_SHRINK_MODE", "auto") == "commanded":
+            self._quorum_timeout = get_timeout(
+                os.environ.get("FT_QUORUM_HOLD_TIMEOUT_S", None),
+                timedelta(seconds=1800),
+            )
         self._connect_timeout: timedelta = get_timeout(
             os.environ.get(CONNECT_TIMEOUT_SEC_ENV, None), connect_timeout
         )

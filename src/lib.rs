@@ -729,7 +729,7 @@ struct LighthouseServer {
 
 #[pymethods]
 impl LighthouseServer {
-    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None, clusterd_addr=None))]
+    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None, clusterd_addr=None, commanded_shrink=None))]
     #[new]
     fn new(
         py: Python<'_>,
@@ -739,11 +739,13 @@ impl LighthouseServer {
         quorum_tick_ms: Option<u64>,
         heartbeat_timeout_ms: Option<u64>,
         clusterd_addr: Option<String>,
+        commanded_shrink: Option<bool>,
     ) -> PyResult<Self> {
         let join_timeout_ms = join_timeout_ms.unwrap_or(100);
         let quorum_tick_ms = quorum_tick_ms.unwrap_or(100);
         let heartbeat_timeout_ms = heartbeat_timeout_ms.unwrap_or(5000);
         let clusterd_addr = clusterd_addr.unwrap_or_default();
+        let commanded_shrink = commanded_shrink.unwrap_or(false);
 
         py.allow_threads(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -760,6 +762,7 @@ impl LighthouseServer {
                     quorum_tick_ms,
                     heartbeat_timeout_ms,
                     clusterd_addr,
+                    commanded_shrink,
                 }))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 

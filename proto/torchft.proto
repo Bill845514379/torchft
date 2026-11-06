@@ -58,6 +58,10 @@ message LighthouseQuorumRequest {
 
 message LighthouseQuorumResponse {
   Quorum quorum = 1;
+  // commanded-shrink (v6.3): set when quorum formation is frozen pending a
+  // clusterd member instruction. The Manager holds internally (never
+  // surfaces an error to the wrapper) until the instruction lands.
+  bool pending_clusterd_decision = 2;
 }
 
 message LighthouseHeartbeatRequest {
