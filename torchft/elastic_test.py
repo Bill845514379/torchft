@@ -376,6 +376,7 @@ class TestWithManager(TestCase):
         self,
         min_replica_size: int = 1,
         world_size_mode: WorldSizeMode = WorldSizeMode.DYNAMIC,
+        use_async_quorum: bool = True,
     ) -> Manager:
         pg = create_autospec(ProcessGroup)
         # pyrefly: ignore [missing-attribute]
@@ -399,7 +400,7 @@ class TestWithManager(TestCase):
                 min_replica_size=min_replica_size,
                 load_state_dict=MagicMock(),
                 state_dict=lambda: {},
-                use_async_quorum=True,
+                use_async_quorum=use_async_quorum,
                 world_size_mode=world_size_mode,
                 init_sync=False,
             )
@@ -423,6 +424,107 @@ class TestWithManager(TestCase):
         quorum.max_world_size = max_world_size
         quorum.heal = False
         return quorum
+
+    def _healing_quorum(self, manager: Manager, client_mock: MagicMock) -> None:
+        # this replica group (rank 1 of 2) is at step 0 and heals to step 20
+        # from rank 0, the only one at max_step
+        quorum = self._quorum(123, None, 1, step=20)
+        quorum.replica_rank = 1
+        quorum.replica_world_size = 2
+        quorum.recover_src_manager_address = "manager address"
+        quorum.recover_src_replica_rank = 0
+        quorum.heal = True
+        client_mock()._quorum.return_value = quorum
+        # stage a checkpoint for the transport to serve back
+        manager._checkpoint_transport.send_checkpoint(
+            dst_ranks=[],
+            step=quorum.max_step,
+            state_dict=manager._manager_state_dict(),
+            timeout=timedelta(seconds=10),
+        )
+        client_mock()._checkpoint_metadata.return_value = (
+            manager._checkpoint_transport.metadata()
+        )
+
+    def _record_plan_steps(self, manager: Manager) -> List[int]:
+        # the Manager step at the moment the plan fn runs
+        plan_fn = manager._plan_fn
+        assert plan_fn is not None
+        steps: List[int] = []
+
+        def recording(view: QuorumView) -> object:
+            steps.append(manager._step)
+            return plan_fn(view)
+
+        manager.set_plan_fn(recording)
+        return steps
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_sync_heal_plans_after_healing(self, client_mock: MagicMock) -> None:
+        manager = self._create_manager(use_async_quorum=False)
+        client_mock().should_commit = mock_should_commit
+        planner = make_planner(manager, G=48, micro=2, D=2, N=4)  # U = 12
+        steps = self._record_plan_steps(manager)
+        self._healing_quorum(manager, client_mock)
+
+        manager.start_quorum()
+        plan = planner.plan()
+        # healed before the plan: it trains step 20 with every replica group
+        self.assertEqual(steps, [20])
+        self.assertEqual((plan.step, plan.P, plan.idx), (20, 2, 1))
+        self.assertEqual(plan.grad_accum_steps, 6)
+        self.assertEqual(plan.sample_range, (20 * 48 + 24, 21 * 48))
+        self.assertEqual(ManagedProcessGroup(manager).size(), 2)
+        self.assertTrue(manager.is_participating())
+        manager.allreduce(torch.tensor([1.0])).wait()
+        self.assertTrue(manager.should_commit())
+        self.assertEqual(manager.current_step(), 21)
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_async_heal_plans_before_healing(self, client_mock: MagicMock) -> None:
+        manager = self._create_manager(use_async_quorum=True)
+        planner = make_planner(manager, G=48, micro=2, D=2, N=4)
+        steps = self._record_plan_steps(manager)
+        self._healing_quorum(manager, client_mock)
+
+        manager.start_quorum()
+        plan = planner.plan()
+        # outside the max-step view while healing: it reads nothing
+        self.assertEqual((plan.step, plan.P, plan.idx), (0, 1, None))
+        self.assertEqual(plan.grad_accum_steps, 0)
+        manager.wait_quorum()
+        self.assertEqual(steps, [0])
+        self.assertEqual(manager.current_step(), 20)
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_sync_reconfigure_error_still_plans(self, client_mock: MagicMock) -> None:
+        # _async_quorum only reports a reconfigure error; wait_plan() must
+        # still return, and the step does not commit
+        manager = self._create_manager(use_async_quorum=False)
+        client_mock().should_commit = mock_should_commit
+        planner = make_planner(manager, G=48, micro=2, D=2, N=4)
+        # pyrefly: ignore [missing-attribute]
+        manager._pg.configure.side_effect = RuntimeError("configure failed")
+        client_mock()._quorum.return_value = self._quorum(1, 1, 3)
+
+        manager.start_quorum()
+        plan = planner.plan()
+        self.assertEqual((plan.step, plan.P, plan.idx), (0, 3, 1))
+        self.assertIsNotNone(manager.errored())
+        self.assertFalse(manager.should_commit())
+
+    @patch("torchft.manager.ManagerClient", autospec=True)
+    def test_sync_plan_error_does_not_fail_the_quorum(
+        self, client_mock: MagicMock
+    ) -> None:
+        manager = self._create_manager(use_async_quorum=False)
+        planner = make_planner(manager, G=48, micro=2, D=2, N=4)  # U = 12
+        client_mock()._quorum.return_value = self._quorum(1, 0, 13)
+        manager.start_quorum()
+        with self.assertRaisesRegex(RuntimeError, "more participating replicas"):
+            planner.plan()
+        self.assertIsNone(manager.errored())
+        self.assertEqual(ManagedProcessGroup(manager).size(), 13)
 
     @patch("torchft.manager.ManagerClient", autospec=True)
     def test_accessors(self, client_mock: MagicMock) -> None:

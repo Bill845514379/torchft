@@ -16,7 +16,6 @@ sample, or a retried step reading different data, shows up as a mismatch.
 
 import copy
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +36,8 @@ INIT_LOCK: threading.Lock = threading.Lock()
 DATASET_LEN = 37  # not a multiple of any G below, so windows cross epochs
 LR = 0.05
 WAIT_S = 60  # upper bound on any cross-replica wait; a hang fails the test
+# Manager args for the synchronous-quorum variants
+SYNC_QUORUM: Dict[str, Any] = {"use_async_quorum": False}
 
 
 def make_dataset() -> Tuple[torch.Tensor, torch.Tensor]:
@@ -184,14 +185,16 @@ def elastic_train_loop(
                     # the joiner's quorum request is already queued
                     assert shared["release"].wait(WAIT_S), "joiner never released"
 
-            optimizer.zero_grad()  # start_quorum + clear grads, every step
             if first and late_join is not None:
                 # The lighthouse forms a fast quorum as soon as all previous
                 # members ask; give the joiner's request time to land first
-                # so it is in the same quorum as them.
-                time.sleep(1.0)
-                shared["release"].set()
+                # so it is in the same quorum as them. A timer, since a
+                # synchronous start_quorum blocks until that quorum forms.
+                release = threading.Timer(1.0, shared["release"].set)
+                release.start()
+                stack.callback(release.cancel)
             first = False
+            optimizer.zero_grad()  # start_quorum + clear grads, every step
             plan = planner.plan()
 
             if plan.grad_accum_steps == 0:
@@ -228,6 +231,7 @@ def elastic_train_loop(
                 manager.report_error(RuntimeError("injected commit failure"))
             entry = {
                 "step": plan.step,  # provisional: stale on the healing replica
+                "plan_step": plan.step,
                 "quorum_id": plan.quorum_id,
                 "P": plan.P,
                 "idx": plan.idx,
@@ -369,6 +373,10 @@ class ElasticIntegTest(TestCase):
         for (step, _), entries in by_step.items():
             if not any(e["committed"] for e in entries):
                 continue
+            for e in entries:
+                if e["committed"] and e["idx"] is not None:
+                    # a participant read the window of the step it committed
+                    self.assertEqual(e["plan_step"], step, e)
             ranges = sorted(e["range"] for e in entries if e["range"] is not None)
             covered: List[int] = []
             for lo, hi in ranges:
@@ -452,6 +460,60 @@ class ElasticIntegTest(TestCase):
         joiner = results[2]["log"]
         self.assertTrue(any(e["idx"] is None and e["ga"] == 0 for e in joiner))
         self.assertGreaterEqual(joiner[0]["step"], 3)
+
+    def test_replica_failure_and_rejoin_sync(self) -> None:
+        # as test_replica_failure_and_rejoin with a synchronous quorum: the
+        # restarted replica heals before its forward pass and participates in
+        # the step it heals to, reading that step's window (_check: every
+        # participant planned the step it committed). It is back in the first
+        # quorum after its restart, so P may never drop to 2.
+        injectors = [EventInjector(), EventInjector(), EventInjector().fail_at(0, 2)]
+        results = self._run(
+            3,
+            G=12,
+            micro=2,
+            steps=8,
+            event_injectors=injectors,
+            manager_args=SYNC_QUORUM,
+        )
+        self._check(results, G=12, steps=8)
+        self.assertEqual(injectors[2].count[EventInjectorEvent.Failure], 1)
+        self.assertEqual(results[0]["log"][-1]["P"], 3)
+        rejoined = results[2]["log"]
+        self.assertTrue(all(e["idx"] is not None for e in rejoined), rejoined)
+
+    def test_scale_up_late_join_sync(self) -> None:
+        # as test_scale_up_late_join with a synchronous quorum: the joiner
+        # starts from scratch, heals and participates in its first step
+        results = self._run(
+            3,
+            G=12,
+            micro=2,
+            steps=9,
+            late_join={2: "empty"},
+            signal_at=3,
+            pause_at_signal=True,
+            manager_args=SYNC_QUORUM,
+        )
+        self._check(results, G=12, steps=9)
+        joiner = results[2]["log"]
+        self.assertGreaterEqual(joiner[0]["step"], 3)
+        self.assertTrue(all(e["idx"] is not None for e in joiner), joiner)
+        self.assertEqual(joiner[0]["P"], 3)
+
+    def test_commit_failure_retry_sync(self) -> None:
+        # as test_commit_failure_retry with a synchronous quorum: replica 1
+        # heals to the others' step and splits the window with them at once
+        results = self._run(
+            3, G=12, micro=2, steps=7, error_at={1: 3}, manager_args=SYNC_QUORUM
+        )
+        self._check(results, G=12, steps=7)
+        log1 = results[1]["log"]
+        failed = next(i for i, e in enumerate(log1) if not e["committed"])
+        heal = log1[failed + 1]
+        self.assertEqual((heal["P"], heal["ga"]), (3, 2))
+        self.assertEqual(heal["step"], log1[failed]["step"] + 1)
+        self.assertTrue(heal["committed"])
 
     def test_same_step_join(self) -> None:
         # Replica 2 loads replica 0's checkpoint taken at the start of step 3

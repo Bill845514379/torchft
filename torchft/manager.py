@@ -34,7 +34,7 @@ import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from enum import Enum
 from typing import (
@@ -152,13 +152,17 @@ class QuorumView:
     The membership of one quorum, as passed to the function registered with
     :py:meth:`Manager.set_plan_fn`.
 
-    It is taken once the quorum RPC has returned, before ProcessGroup
-    reconfiguration and healing.
+    With ``use_async_quorum=True`` or ``allow_heal=False`` it is taken once
+    the quorum RPC has returned, before ProcessGroup reconfiguration and
+    healing. A synchronous quorum that allows healing takes it after both,
+    since every participant, healed or not, trains the step it ends on.
     """
 
     quorum_id: int
-    # the step this replica group reported to the quorum; a healing replica
-    # group jumps to max_step only later, after healing
+    # the step this replica group trains with this quorum: the step it
+    # reported to the quorum, or after a synchronous heal the healed step.
+    # An async healing replica group is outside the participants and jumps
+    # to max_step only later.
     step: int
     # what num_participants() returns for this quorum
     num_participants: int
@@ -662,12 +666,16 @@ class Manager:
         membership. Call it before :py:meth:`start_quorum`; it applies from
         the next quorum on.
 
-        The function runs on the quorum thread as soon as the quorum RPC has
-        returned, before ProcessGroup reconfiguration and healing, and its
-        result is returned by :py:meth:`wait_plan`. It must only compute: it
-        must not call the Manager methods that wait for the quorum (which
-        would deadlock), nor do I/O or collectives, since reconfiguration and
-        healing wait for it.
+        The function runs on the quorum thread and its result is returned by
+        :py:meth:`wait_plan`. With ``use_async_quorum=True`` or
+        ``allow_heal=False`` it runs as soon as the quorum RPC has returned,
+        before ProcessGroup reconfiguration and healing, so the forward pass
+        can start without waiting for them. A synchronous quorum that allows
+        healing runs it after both: :py:meth:`start_quorum` waits for them
+        anyway, and a healed replica group participates in the step, so the
+        plan must see its healed step. It must only compute: it must not call
+        the Manager methods that wait for the quorum (which would deadlock),
+        nor do I/O or collectives, since the rest of the quorum waits for it.
 
         The function cannot be changed while a quorum is in progress, since
         that quorum's waiters would be left with a plan that never completes.
@@ -693,7 +701,9 @@ class Manager:
         Wait for the plan of the current quorum.
 
         Unlike :py:meth:`wait_quorum` this does not wait for ProcessGroup
-        reconfiguration or healing.
+        reconfiguration or healing, except with a synchronous quorum that
+        allows healing, where the plan is computed after them (see
+        :py:meth:`set_plan_fn`).
 
         Returns:
             what the function registered with :py:meth:`set_plan_fn` returned
@@ -736,6 +746,31 @@ class Manager:
             if plan_future is not None and not plan_future.done():
                 plan_future.set_exception(e)
             raise
+
+        # A synchronous quorum that allows healing plans here, after every
+        # return path of _async_quorum, including a reconfiguration or
+        # recovery error that it only reports: the step does not commit then,
+        # but wait_plan() must not hang.
+        plan_view = self._plan_view
+        plan_future = self._plan_future
+        if plan_view is not None and plan_future is not None and not plan_future.done():
+            self._plan_view = replace(plan_view, step=self._step)
+            self._compute_plan(self._plan_view, plan_future)
+
+    def _compute_plan(
+        self, view: QuorumView, plan_future: concurrent.futures.Future
+    ) -> None:
+        plan_fn = self._plan_fn
+        assert plan_fn is not None, "plan future without a plan fn"
+        try:
+            plan = plan_fn(view)
+        except Exception as e:
+            # a planning error is not a quorum error: only the plan's
+            # waiters see it, reconfiguration and healing go on
+            self._logger.exception(f"got exception in plan fn: {e}")
+            plan_future.set_exception(e)
+        else:
+            plan_future.set_result(plan)
 
     @torch.profiler.record_function("torchft::manager::_async_quorum")
     def _async_quorum(
@@ -802,25 +837,19 @@ class Manager:
                 self._participating_replica_rank = None
 
         # membership point: hand the plan to wait_plan() before the expensive
-        # reconfiguration and healing below
-        plan_fn = self._plan_fn
+        # reconfiguration and healing below. A synchronous quorum that allows
+        # healing only records the membership here; _run_async_quorum plans
+        # once healing has set the step this replica group trains.
         plan_future = self._plan_future
-        if plan_fn is not None and plan_future is not None:
+        if self._plan_fn is not None and plan_future is not None:
             self._plan_view = QuorumView(
                 quorum_id=quorum_id,
                 step=step,
                 num_participants=self._participating_replica_world_size,
                 participating_rank=self._participating_replica_rank,
             )
-            try:
-                plan = plan_fn(self._plan_view)
-            except Exception as e:
-                # a planning error is not a quorum error: only the plan's
-                # waiters see it, reconfiguration and healing go on
-                self._logger.exception(f"got exception in plan fn: {e}")
-                plan_future.set_exception(e)
-            else:
-                plan_future.set_result(plan)
+            if self._use_async_quorum or not allow_heal:
+                self._compute_plan(self._plan_view, plan_future)
 
         if quorum_id != self._quorum_id:
             self.quorum_logger.info(

@@ -23,9 +23,12 @@ on the surviving replicas.
 
 Requirements:
 
-* ``use_async_quorum=True`` (the default) and ``init_sync=False`` on the
-  Manager. A healing replica must not read data, which only holds when it is
-  outside the max-step view.
+* ``init_sync=False`` on the Manager.
+* A healing replica group reads the window of the step it trains. With
+  ``use_async_quorum=True`` (the default) it is outside the max-step view
+  while it heals, so it reads no data. A synchronous quorum that allows
+  healing heals it before the forward pass and computes the plan after
+  healing, so it participates with the healed step.
 * The dataset supports random access by index.
 """
 
