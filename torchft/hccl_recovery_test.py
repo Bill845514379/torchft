@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 from torch.distributed import distributed_c10d
 
 from torchft.hccl_recovery import HcclRecovery, HcclRecoveryError, RecoveryResult
@@ -506,3 +507,320 @@ def test_configure_aborts_collects_and_settles_before_recreate(monkeypatch):
     pg.configure("store:1/prefix", "0", 0, 1)
 
     assert calls == [("abort", False), "gc", ("sleep", 2.0), "create"]
+
+
+def _healthy_npu_pg():
+    pg = Mock()
+    pg._device_types = {torch.device("npu")}
+    pg._get_backend.return_value = Mock()
+    return pg
+
+
+def test_recovery_resumes_healthy_groups_instead_of_rebuilding(
+    monkeypatch, deferred_timers
+):
+    broken = Mock()
+    broken._get_backend.return_value = Mock()
+    healthy = _healthy_npu_pg()
+    recovery = _recovery(get_process_group=lambda: broken)
+    recovery.prepare_group(0)
+    recovery.group_created()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(
+                stop_device=lambda device: None,
+                restart_device=lambda device, **kwargs: None,
+            )
+        ),
+    )
+    # ``broken`` was already dropped from the global map by the time the
+    # remaining groups are visited.
+    monkeypatch.setattr(distributed_c10d, "_pg_map", {healthy: None})
+    monkeypatch.setattr(
+        distributed_c10d,
+        "_cleanup_process_group_global_state",
+        lambda group: None,
+        raising=False,
+    )
+
+    thread = threading.Thread(target=recovery.force_recover)
+    thread.start()
+    assert recovery._recovery_requested.wait(1)
+    assert recovery.recover(RuntimeError("NPU FORCE STOP"))
+    thread.join(1)
+
+    backend = healthy._get_backend.return_value
+    backend.resume_hccl_comm.assert_called_once_with(0)
+    backend.abort_hccl_comm.assert_not_called()
+    backend._delete_tcpstore_key.assert_not_called()
+
+
+def test_recovery_rebuilds_group_when_resume_fails(monkeypatch, deferred_timers):
+    broken = Mock()
+    broken._get_backend.return_value = Mock()
+    healthy = _healthy_npu_pg()
+    healthy._get_backend.return_value.resume_hccl_comm.side_effect = RuntimeError(
+        "resume failed"
+    )
+    recovery = _recovery(get_process_group=lambda: broken)
+    recovery.prepare_group(0)
+    recovery.group_created()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(
+                stop_device=lambda device: None,
+                restart_device=lambda device, **kwargs: None,
+            )
+        ),
+    )
+    monkeypatch.setattr(distributed_c10d, "_pg_map", {healthy: None})
+    monkeypatch.setattr(
+        distributed_c10d,
+        "_cleanup_process_group_global_state",
+        lambda group: None,
+        raising=False,
+    )
+
+    thread = threading.Thread(target=recovery.force_recover)
+    thread.start()
+    assert recovery._recovery_requested.wait(1)
+    assert recovery.recover(RuntimeError("NPU FORCE STOP"))
+    thread.join(1)
+
+    backend = healthy._get_backend.return_value
+    backend._delete_tcpstore_key.assert_called_once_with()
+    backend.abort_hccl_comm.assert_called_once_with("reinit")
+
+
+def test_recovery_rebuilds_only_the_group_whose_resume_fails(
+    monkeypatch, deferred_timers
+):
+    broken = Mock()
+    broken._get_backend.return_value = Mock()
+    resumed = _healthy_npu_pg()
+    rebuilt = _healthy_npu_pg()
+    rebuilt._get_backend.return_value.resume_hccl_comm.side_effect = RuntimeError(
+        "resume failed"
+    )
+    recovery = _recovery(get_process_group=lambda: broken)
+    recovery.prepare_group(0)
+    recovery.group_created()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(
+                stop_device=lambda device: None,
+                restart_device=lambda device, **kwargs: None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        distributed_c10d,
+        "_pg_map",
+        {resumed: None, rebuilt: None},
+    )
+    monkeypatch.setattr(
+        distributed_c10d,
+        "_cleanup_process_group_global_state",
+        lambda group: None,
+        raising=False,
+    )
+
+    thread = threading.Thread(target=recovery.force_recover)
+    thread.start()
+    assert recovery._recovery_requested.wait(1)
+    assert recovery.recover(RuntimeError("NPU FORCE STOP"))
+    thread.join(1)
+    assert not thread.is_alive()
+
+    resumed_backend = resumed._get_backend.return_value
+    resumed_backend.resume_hccl_comm.assert_called_once_with(0)
+    resumed_backend._delete_tcpstore_key.assert_not_called()
+    resumed_backend.abort_hccl_comm.assert_not_called()
+
+    rebuilt_backend = rebuilt._get_backend.return_value
+    rebuilt_backend.resume_hccl_comm.assert_called_once_with(0)
+    rebuilt_backend._delete_tcpstore_key.assert_called_once_with()
+    rebuilt_backend.abort_hccl_comm.assert_called_once_with("reinit")
+
+
+def test_recovery_can_disable_resume(monkeypatch, deferred_timers):
+    monkeypatch.setenv("TORCHFT_HCCL_RESUME_COMM", "false")
+    broken = Mock()
+    broken._get_backend.return_value = Mock()
+    healthy = _healthy_npu_pg()
+    recovery = _recovery(get_process_group=lambda: broken)
+    recovery.prepare_group(0)
+    recovery.group_created()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(
+                stop_device=lambda device: None,
+                restart_device=lambda device, **kwargs: None,
+            )
+        ),
+    )
+    monkeypatch.setattr(distributed_c10d, "_pg_map", {healthy: None})
+    monkeypatch.setattr(
+        distributed_c10d,
+        "_cleanup_process_group_global_state",
+        lambda group: None,
+        raising=False,
+    )
+
+    thread = threading.Thread(target=recovery.force_recover)
+    thread.start()
+    assert recovery._recovery_requested.wait(1)
+    assert recovery.recover(RuntimeError("NPU FORCE STOP"))
+    thread.join(1)
+
+    backend = healthy._get_backend.return_value
+    backend.resume_hccl_comm.assert_not_called()
+    backend._delete_tcpstore_key.assert_called_once_with()
+    backend.abort_hccl_comm.assert_called_once_with("reinit")
+
+
+def test_managed_watchdog_is_disabled_by_default():
+    recovery = _recovery()
+
+    assert not recovery.managed_watchdog
+
+
+def test_managed_watchdog_stays_stopped_through_recovery(
+    monkeypatch, deferred_timers
+):
+    monkeypatch.setenv("TORCHFT_HCCL_MANAGED_WATCHDOG", "true")
+    calls = []
+    broken = Mock()
+    broken_backend = Mock()
+    broken_backend.set_watchdog_status.side_effect = lambda status: calls.append(
+        ("broken-status", status)
+    )
+    broken_backend.abort_hccl_comm.side_effect = lambda reason: calls.append(
+        ("broken-abort", reason)
+    )
+    broken._get_backend.return_value = broken_backend
+
+    healthy = _healthy_npu_pg()
+    healthy_backend = healthy._get_backend.return_value
+    healthy_backend.set_watchdog_status.side_effect = lambda status: calls.append(
+        ("healthy-status", status)
+    )
+    healthy_backend.resume_hccl_comm.side_effect = lambda device: calls.append(
+        ("healthy-resume", device)
+    )
+
+    recovery = _recovery(get_process_group=lambda: broken)
+    recovery.prepare_group(0)
+    recovery.group_created()
+
+    recovery_module = SimpleNamespace(
+        WATCHDOG_STATUS_RUN=1,
+        WATCHDOG_STATUS_STOP=2,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(
+                stop_device=lambda device: calls.append(("stop-device", device)),
+                restart_device=lambda device, **kwargs: calls.append(
+                    ("restart-device", device)
+                ),
+                _recovery=recovery_module,
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.npu._recovery",
+        recovery_module,
+    )
+    monkeypatch.setattr(distributed_c10d, "_pg_map", {healthy: None})
+    monkeypatch.setattr(
+        distributed_c10d,
+        "_cleanup_process_group_global_state",
+        lambda group: None,
+        raising=False,
+    )
+
+    thread = threading.Thread(target=recovery.force_recover)
+    thread.start()
+    assert recovery._recovery_requested.wait(1)
+    assert recovery.recover(RuntimeError("NPU FORCE STOP"))
+    thread.join(1)
+    assert not thread.is_alive()
+
+    assert calls == [
+        ("healthy-status", 2),
+        ("broken-status", 2),
+        ("stop-device", 0),
+        ("broken-abort", "reinit"),
+        ("restart-device", 0),
+        ("healthy-status", 2),
+        ("healthy-resume", 0),
+        ("healthy-status", 1),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("managed_watchdog", "expected_status"),
+    [("false", 2), ("true", 1)],
+)
+def test_process_group_creation_uses_managed_watchdog_setting(
+    monkeypatch, managed_watchdog, expected_status
+):
+    from torchft.process_group import ProcessGroupHCCL
+
+    monkeypatch.setenv("TORCHFT_HCCL_MANAGED_WATCHDOG", managed_watchdog)
+    recovery_module = SimpleNamespace(
+        WATCHDOG_STATUS_RUN=1,
+        WATCHDOG_STATUS_STOP=2,
+    )
+    backend = Mock()
+    backend_statuses = []
+    backend.set_watchdog_status.side_effect = backend_statuses.append
+
+    class ProcessGroupHCCLBackend:
+        class Options:
+            pass
+
+        def __new__(cls, store, rank, world_size, options):
+            return backend
+
+    native_module = SimpleNamespace(ProcessGroupHCCL=ProcessGroupHCCLBackend)
+    torch_npu = SimpleNamespace(
+        npu=SimpleNamespace(_recovery=recovery_module)
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
+    monkeypatch.setitem(
+        sys.modules, "torch_npu._C._distributed_c10d", native_module
+    )
+    monkeypatch.setitem(
+        sys.modules, "torch_npu.npu._recovery", recovery_module
+    )
+
+    process_group = Mock()
+    process_group._set_default_backend = Mock()
+    process_group._register_backend = Mock()
+    monkeypatch.setattr(
+        "torchft.process_group.BaseProcessGroup",
+        lambda store, rank, world_size: process_group,
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+    pg = ProcessGroupHCCL(recovery_timeout=timedelta(seconds=1))
+    pg._create_pg(Mock(), 0, 1)
+
+    assert backend_statuses == [expected_status]
