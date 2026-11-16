@@ -211,6 +211,12 @@ class HcclRecovery:
         self._resume_comm = (
             os.environ.get("TORCHFT_HCCL_RESUME_COMM", "true") == "true"
         )
+        # Keep the native HCCL watchdog enabled during normal training and
+        # disable it only while TorchFT performs device/communicator recovery.
+        # This setting is read once and must be identical across all ranks.
+        self._managed_watchdog = (
+            os.environ.get("TORCHFT_HCCL_MANAGED_WATCHDOG", "false") == "true"
+        )
         self._recovery_error: BaseException | None = None
         self._errored: Exception | None = None
         self._device_index: int | None = None
@@ -223,6 +229,10 @@ class HcclRecovery:
     def watchdog_timeout(self) -> timedelta:
         # Leave time for Python recovery before the fatal HCCL watchdog.
         return self._warmup_timeout + self.recovery_timeout + timedelta(seconds=30)
+
+    @property
+    def managed_watchdog(self) -> bool:
+        return self._managed_watchdog
 
     @property
     def recovery_generation(self) -> int:
@@ -347,6 +357,50 @@ class HcclRecovery:
         self._recovery_requested.set()
         self._errored = HcclRecoveryError(error_message)
 
+    def _set_npu_watchdog_status(
+        self,
+        status: int,
+        *,
+        extra_pg: ProcessGroup | None = None,
+        strict: bool = True,
+    ) -> None:
+        if not self._managed_watchdog:
+            return
+
+        from torch.distributed.distributed_c10d import _pg_map
+
+        npu_device = torch.device("npu")
+        process_groups = list(tuple(_pg_map))
+        if extra_pg is not None and not any(
+            process_group is extra_pg for process_group in process_groups
+        ):
+            process_groups.append(extra_pg)
+
+        failure: tuple[ProcessGroup, Exception] | None = None
+        for process_group in process_groups:
+            if (
+                process_group is not extra_pg
+                and npu_device not in process_group._device_types
+            ):
+                continue
+            try:
+                backend = cast("Any", process_group._get_backend(npu_device))
+                backend.set_watchdog_status(status)
+            except Exception as error:
+                if failure is None:
+                    failure = (process_group, error)
+                logger.exception(
+                    "Failed to set HCCL watchdog status %s for %s",
+                    status,
+                    process_group,
+                )
+
+        if failure is not None and strict:
+            process_group, error = failure
+            raise RuntimeError(
+                f"Failed to set HCCL watchdog status {status} for {process_group}"
+            ) from error
+
     def _perform_recovery(self, pg: ProcessGroup, reason: str) -> None:
         """Stop/restart the device and rebuild communicators."""
         try:
@@ -355,6 +409,15 @@ class HcclRecovery:
             # Latch the failure before waking ``recover()`` so it cannot observe a
             # ready device without the corresponding error.
             self._recovery_error = error
+            if self._managed_watchdog:
+                try:
+                    from torch_npu.npu._recovery import WATCHDOG_STATUS_STOP
+
+                    self._set_npu_watchdog_status(
+                        WATCHDOG_STATUS_STOP, extra_pg=pg, strict=False
+                    )
+                except Exception:
+                    logger.exception("Failed to leave the HCCL watchdog stopped")
             raise
         finally:
             self._device_ready.set()
@@ -364,6 +427,10 @@ class HcclRecovery:
         backend = cast("Any", pg._get_backend(torch.device("npu")))
         import torch_npu
 
+        if self._managed_watchdog:
+            from torch_npu.npu._recovery import WATCHDOG_STATUS_STOP
+
+            self._set_npu_watchdog_status(WATCHDOG_STATUS_STOP, extra_pg=pg)
         logger.warning("Stopping NPU %d %s", self._device_index, reason)
         result = torch_npu.npu.stop_device(self._device_index)
         if result not in (None, 0):
@@ -398,6 +465,10 @@ class HcclRecovery:
         if accepts_unsafe_check:
             restart_kwargs["disable_tensor_unsafe_check"] = True
         torch_npu.npu.restart_device(self._device_index, **restart_kwargs)
+        # restart_device sets registered NPU PGs back to RUN. Keep the
+        # watchdog stopped until all suspended communicators are resumed.
+        if self._managed_watchdog:
+            self._set_npu_watchdog_status(WATCHDOG_STATUS_STOP)
         if not accepts_unsafe_check:
             from torch_npu.npu._recovery import (
                 set_npu_tensor_unsafe_check_flag,
@@ -431,6 +502,10 @@ class HcclRecovery:
                     )
             remaining_backend._delete_tcpstore_key()
             remaining_backend.abort_hccl_comm("reinit")
+        if self._managed_watchdog:
+            from torch_npu.npu._recovery import WATCHDOG_STATUS_RUN
+
+            self._set_npu_watchdog_status(WATCHDOG_STATUS_RUN)
         self.num_device_recoveries += 1
         self._recovery_generation += 1
         self._not_ready_since = None
