@@ -1186,14 +1186,21 @@ class ProcessGroupHCCL(ProcessGroupWrapper):
         backend_class = BaseProcessGroupHCCL(store, rank, world_size, opts)
         backend_class._set_sequence_number_for_group()
 
-        # Stop the HCCL watchdog: torchft owns the timeout and recovery.
+        managed_watchdog = (
+            not self._use_abort and self.recovery.managed_watchdog
+        )
         try:
             from torch_npu.npu._recovery import WATCHDOG_STATUS_STOP
 
-            backend_class.set_watchdog_status(WATCHDOG_STATUS_STOP)
+            watchdog_status = WATCHDOG_STATUS_STOP
+            if managed_watchdog:
+                from torch_npu.npu._recovery import WATCHDOG_STATUS_RUN
+
+                watchdog_status = WATCHDOG_STATUS_RUN
+            backend_class.set_watchdog_status(watchdog_status)
         except Exception as e:
             logger.warning(
-                f"failed to stop HCCL watchdog, relying on it for timeout: {e}"
+                f"failed to configure HCCL watchdog status, relying on its default: {e}"
             )
 
         pg._register_backend(
