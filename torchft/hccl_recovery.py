@@ -11,14 +11,18 @@ This module implements the scheme validated on Ascend NPU:
 * a step-level side thread detects a hang outside the tracked TorchFT PG;
 * ``stop_device`` interrupts the in-flight collective;
 * ``restart_device`` rebuilds device resources;
-* every remaining NPU PG deletes its stale TCP store key and aborts its HCCL
-  communicator so the next collective re-creates the link from fresh root info;
+* the broken TorchFT PG is dropped so the next quorum re-creates it;
+* every other NPU PG on the device was only suspended by ``stop_device``, so its
+  cached HCCL communicators are resumed in place (``resume_hccl_comm``) instead
+  of being aborted and rebuilt on all of their ranks;
 * the interrupted attempt is discarded and the next step starts a new quorum.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -201,6 +205,12 @@ class HcclRecovery:
         self._stop_observed = threading.Event()
         self._device_ready = threading.Event()
         self._device_ready.set()
+        # Resume suspended communicators in place instead of aborting them,
+        # which would force a full rebuild on every rank of every group. This
+        # setting is read once and must be identical across all ranks.
+        self._resume_comm = (
+            os.environ.get("TORCHFT_HCCL_RESUME_COMM", "true") == "true"
+        )
         self._recovery_error: BaseException | None = None
         self._errored: Exception | None = None
         self._device_index: int | None = None
@@ -372,17 +382,55 @@ class HcclRecovery:
         _cleanup_process_group_global_state(pg)
         self._clear_process_group(pg)
         self.work_tracker.clear()
-        torch_npu.npu.restart_device(
-            self._device_index,
-            rebuild_all_resources=True,
-            disable_tensor_unsafe_check=True,
+        restart_kwargs: dict[str, Any] = {"rebuild_all_resources": True}
+        # torch_npu 2.10 removed this older keyword; keep compatibility with
+        # releases that still expose it.
+        restart_parameters = inspect.signature(
+            torch_npu.npu.restart_device
+        ).parameters
+        accepts_unsafe_check = (
+            "disable_tensor_unsafe_check" in restart_parameters
+            or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in restart_parameters.values()
+            )
         )
+        if accepts_unsafe_check:
+            restart_kwargs["disable_tensor_unsafe_check"] = True
+        torch_npu.npu.restart_device(self._device_index, **restart_kwargs)
+        if not accepts_unsafe_check:
+            from torch_npu.npu._recovery import (
+                set_npu_tensor_unsafe_check_flag,
+            )
+
+            set_npu_tensor_unsafe_check_flag(False)
+        # The broken TorchFT PG was dropped above and will be re-created by
+        # ``configure()`` for the next quorum. Every other NPU PG on this
+        # device was only suspended by ``stop_device`` and is still valid, so
+        # resume its cached communicators in place. Aborting them would make
+        # every rank of those groups rebuild the communicator, which dominates
+        # the recovery cost. ``HcclCommResume`` requires a cluster-wide sync
+        # first; every replica runs the same recovery at the same step
+        # boundary, so no extra barrier is needed here and the next collective
+        # on each group proceeds normally.
         npu_device = torch.device("npu")
         for remaining_pg in tuple(_pg_map):
-            if npu_device in remaining_pg._device_types:
-                remaining_backend = cast("Any", remaining_pg._get_backend(npu_device))
-                remaining_backend._delete_tcpstore_key()
-                remaining_backend.abort_hccl_comm("reinit")
+            if npu_device not in remaining_pg._device_types:
+                continue
+            remaining_backend = cast("Any", remaining_pg._get_backend(npu_device))
+            if self._resume_comm:
+                try:
+                    remaining_backend.resume_hccl_comm(self._device_index)
+                    continue
+                except Exception as error:
+                    logger.warning(
+                        "resume_hccl_comm failed for %s, rebuilding its "
+                        "communicators instead: %s",
+                        remaining_pg,
+                        error,
+                    )
+            remaining_backend._delete_tcpstore_key()
+            remaining_backend.abort_hccl_comm("reinit")
         self.num_device_recoveries += 1
         self._recovery_generation += 1
         self._not_ready_since = None
